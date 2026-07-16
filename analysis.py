@@ -32,6 +32,7 @@ from config import (
     RETRACT_DIST_M,
     RETRACT_Z_RISE_M,
     WITHDRAW_HOME_M,
+    GRIP_EMPTY_CLOSED_MAX
 )
 from models import TaskJudgment, TaskSignals
 
@@ -348,14 +349,26 @@ def judge_task_simple(
     fz_ok = t.fz_spike_grasp >= FZ_CONTACT_MIN
     transport_ok = t.grasp_transport_m >= GRASP_TRANSPORT_M
     has_load = abs_ok or rel_ok or fz_ok
+    
+    is_empty_grasp = False
+    if t.grip_min_val < GRIP_EMPTY_CLOSED_MAX:
+        is_empty_grasp = True
 
     if not has_grasp_attempt:
         has_grasp_contact = False
         has_grasp_object = False
     else:
         has_grasp_contact = has_load
+        # 只要夹空了，不管电流多大，都认为 object = False
+        has_grasp_object = (has_load or (transport_ok and has_load)) and not is_empty_grasp
+    """""  
+    if not has_grasp_attempt:
+        has_grasp_contact = False
+        has_grasp_object = False
+    else:
+        has_grasp_contact = has_load
         has_grasp_object = has_load or (transport_ok and has_load)
-
+    """
     # --- 放置相位 ---
     has_place_phase = False
     place_at_box = False
