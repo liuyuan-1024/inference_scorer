@@ -102,7 +102,8 @@ GRIP_CLOSE_THRESHOLD: float = 0.50
 GRIP_RELEASE_RISE: float = 0.15
 # 夹爪释放检测：抓取前必须闭合程度
 GRIP_PRE_CLOSE_MAX: float = 0.30
-
+# 夹爪空夹检测：避免夹爪空夹，互相给予力反馈误判为稳定抓取
+GRIP_EMPTY_CLOSED_MAX: float = 0.1
 # =========================== 通用阈值 ===========================
 
 MIN_FRAMES: int = 3  # task 最少帧数

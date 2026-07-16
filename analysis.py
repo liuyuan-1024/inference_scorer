@@ -32,6 +32,7 @@ from config import (
     RETRACT_DIST_M,
     RETRACT_Z_RISE_M,
     WITHDRAW_HOME_M,
+    GRIP_EMPTY_CLOSED_MAX
 )
 from models import TaskJudgment, TaskSignals
 
@@ -66,6 +67,14 @@ def detect_grasp_event(t: TaskSignals) -> tuple[int | None, str | None]:
         valid_grip = grip[valid_mask]
         valid_idx = np.where(valid_mask)[0]
 
+        # 寻找首次低于闭合阈值的帧，且往前追溯5帧内曾经张开过
+        for i in range(1, len(valid_grip)):
+            if valid_grip[i] < GRIP_CLOSE_THRESHOLD:
+                lookback = max(0, i - 5)
+                if np.any(valid_grip[lookback:i] > GRIP_OPEN_THRESHOLD):
+                    frame = valid_idx[i]
+                    return frame, "grip"
+        """        
         # 找首次 grip 从"张开"(>0.7) 下降到"闭合"(<0.5) 的帧并且下降幅度 > 0.3（排除噪声）
         for i in range(len(valid_grip) - 1):
             if (
@@ -75,7 +84,7 @@ def detect_grasp_event(t: TaskSignals) -> tuple[int | None, str | None]:
             ):
                 frame = valid_idx[i + 1]
                 return frame, "grip"
-
+        """
     # --- 策略 2：关节电流尖峰检测 ---
     # 忽略前 5 帧的初始化冲击（机器人复位/启动时 JC 可能短暂偏高）
     JC_IGNORE_FRAMES: int = 5
@@ -348,14 +357,31 @@ def judge_task_simple(
     fz_ok = t.fz_spike_grasp >= FZ_CONTACT_MIN
     transport_ok = t.grasp_transport_m >= GRASP_TRANSPORT_M
     has_load = abs_ok or rel_ok or fz_ok
+    
+    is_empty_grasp = False
+    if t.grip_min_val < GRIP_EMPTY_CLOSED_MAX:
+        is_empty_grasp = True
 
+    # 【新增拦截2】：夹爪是不是全程都没关上？
+    is_always_open = False
+    if t.grip_min_val > GRIP_CLOSE_THRESHOLD:
+        is_always_open = True
+        
+    if not has_grasp_attempt:
+        has_grasp_contact = False
+        has_grasp_object = False
+    else:
+        has_grasp_contact = has_load
+        # 只要夹空了，不管电流多大，都认为 object = False,如果全程是打开的也是没有夹到东西
+        has_grasp_object = (has_load or (transport_ok and has_load)) and not is_empty_grasp and not is_always_open
+    """""  
     if not has_grasp_attempt:
         has_grasp_contact = False
         has_grasp_object = False
     else:
         has_grasp_contact = has_load
         has_grasp_object = has_load or (transport_ok and has_load)
-
+    """
     # --- 放置相位 ---
     has_place_phase = False
     place_at_box = False
