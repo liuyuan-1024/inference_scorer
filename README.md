@@ -9,9 +9,16 @@ python3 auto_score.py --data-dir xxx/action-step_* --excel 机械臂抓取模型
 
 # 查看评分规则
 python3 auto_score.py --explain
-
-uv run auto_score.py --data-dir .local/0870000/action-step_70
 ```
+
+运行后会同时生成：
+
+- 填好 S1~S5 的 Excel；
+- `auto_score_summary.json`（分数、置信度、证据、待复核原因）；
+- 每个评分单元格的 Excel 批注（便于人工追溯）。
+
+视频增强使用 `opencv-python-headless` 直接读取视频。缺少视频或 OpenCV
+无法读取视频时会自动退化为传感器保守评分，并把受影响维度标记为待人工复核。
 
 # 数据映射关系
 
@@ -31,10 +38,10 @@ uv run auto_score.py --data-dir .local/0870000/action-step_70
 |维度|分值范围|自动判定依据|
 |---|---|---|
 | S1定位 | 0~4| has_motion + approach_quality + 定位时间 |
-| S2抓取 | 0~3| has_grasp_contact + has_grasp_object + joint_current 负载信号 |
-| S3搬运 | 0~2| grasp_transport_m + 是否朝向放置ROI |
-| S4投放 | 0~3| grip_release + has_place_phase + 是否在ROI内 |
-| S5归位 | 0~2| withdraw_home_dist_m + has_retract |
+| S2抓取 | 0~3| 渐进闭合事件 + 空夹拦截 + 玩具随动 + 去基线力/电流 |
+| S3搬运 | 0~2| 玩具是否随夹爪移动并接近盒口 |
+| S4投放 | 0~3| 释放事件 + 玩具最终与盒子轮廓的空间关系 |
+| S5归位 | 0~2| 明确的离开—返回轨迹 + xy/z误差 + 时间 + 夹爪状态 |
 
 # 各维度的评分规则细节
 
@@ -75,7 +82,9 @@ graph LR
     A[eval_log.jsonl] --> B[loader.py<br>数据加载]
     C[machine_flow.jsonl] --> B
     B --> D[TaskSignals<br>原始信号]
-    D --> E[analysis.py<br>抓取检测/阶段分析]
+    V[胸前视频 + frame_timestamps] --> X[vision.py<br>玩具/盒子/OOD证据]
+    X --> E
+    D --> E[analysis.py<br>传感器与视频融合判定]
     E --> F[TaskJudgment<br>语义判定]
     F --> G[scoring.py<br>S1~S5 打分]
     G --> H[excel_io.py<br>写入 Excel]
@@ -96,6 +105,7 @@ config.py           # 配置文件（所有阈值、映射、常量）
 models.py           # 数据结构（TaskSignals, TaskJudgment）
 loader.py           # 数据加载（eval_log.jsonl 解析）
 analysis.py         # 信号分析（抓取检测、阶段划分、语义判定）
+vision.py           # OpenCV 视频读取、HSV 分割、形态学去噪与轮廓分析
 scoring.py          # 评分映射（S1~S5 打分函数）
 excel_io.py         # Excel 读写
 ```
@@ -114,8 +124,10 @@ excel_io.py         # Excel 读写
 | `EXCEL_FILENAME` | 机械臂抓取模型反馈评分模型.xlsx | 评分 Excel 文件名 |
 | `EXCEL_SHEET_NAME` | 推理 (2) | Excel sheet 名 |
 
-# 当前局限
+# 当前局限与复核策略
 
-1. 马的姿态、有马无盒、有盒无马的情况识别（需视频目标检测支持）
-2. 夹爪释放检测在有抓取信号的 task 才有效，无抓取时无法判定 S4
-3. 放置 ROI 通过学习各 task 终点位置自动估计，若所有 task 均未抓取则使用默认值
+1. 轻量视觉针对当前“红色玩具 + 黄色盒子”布景；颜色、光照或目标类别变化后需重新标定，或替换为正式分割模型。
+2. S1 的 2cm/3cm 条件需要相机内外参和桌面坐标标定；未标定时 S1=3/4 会自动标记复核。
+3. v5 对“有马无盒/有盒无马”没有 N/A 规则。当前 S3/S4 保守记 0，并在摘要中提示应增加独立鲁棒性指标。
+4. v5 的 S5 夹爪状态存在“张开/闭合”文字冲突；当前按评分细则 E23 采用“张开”，可在 `config.py` 中切换。
+5. 设备状态反馈超时、遮挡或视觉/传感器冲突不会静默给高分，而会降低置信度并要求人工复核。

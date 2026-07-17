@@ -43,23 +43,25 @@ EXCEL_SHEET_NAME: str = "推理 (2)"
 
 # =========================== 运动检测阈值 ===========================
 
-# EE 轨迹 ≥ 0.20m → 有移动
-MOTION_EE_PATH_M: float = 0.20
-# 关节累计 ≥ 0.15rad → 有移动（EE 缺失时备用）
-MOTION_JOINT_RAD: float = 0.15
+# v5: 任一关节相对初始位置变化 ≥ 1° → 有移动
+MOTION_JOINT_EXCURSION_RAD: float = 0.017453292519943295
+# EE 相对初始位置移动 ≥ 1cm → 有移动
+MOTION_EE_EXCURSION_M: float = 0.01
 
 # =========================== 抓取接触阈值 ===========================
 
 # 抓取相位前后帧数（窗口）
 GRASP_PHASE_WINDOW: int = 8
-# 抓取窗口 max|fz| ≥ 5N → 接触
-FZ_CONTACT_MIN: float = 5.0
-# max(jc) ≥ jc_p25 + 400 → 绝对负载
-JC_CONTACT_DELTA: int = 400
-# jc 尖峰 − 抓取前均值 ≥ 600 → 相对负载
-JC_GRASP_RISE_MIN: float = 600
+# 抓取窗口 Fz 相对抓取前中位数变化 ≥ 0.8N → 接触候选
+FZ_CONTACT_DELTA_MIN: float = 0.8
+# 单关节电流相对抓取前中位数变化 ≥ 800 → 接触候选
+JC_CONTACT_DELTA: int = 800
+# JC fallback 仅在没有可靠夹爪反馈时启用
+JC_GRASP_RISE_MIN: float = 900
 # 抓取后 EE 累计位移 ≥ 0.06m 且负载 → 抓上并带走
 GRASP_TRANSPORT_M: float = 0.06
+# v5 稳定抓取要求物体抬离桌面 ≥ 5cm
+GRASP_LIFT_M: float = 0.05
 
 # =========================== 靠近阶段阈值 ===========================
 
@@ -80,8 +82,15 @@ FAST_APPROACH_FRAC: float = 0.40
 RETRACT_DIST_M: float = 0.06
 # z 抬升 ≥ 0.035m
 RETRACT_Z_RISE_M: float = 0.035
-# 末端距起始 ≤ 0.12m → 归位
-WITHDRAW_HOME_M: float = 0.12
+# v5: 归位水平误差 ≤ 10cm、垂直误差 ≤ 5cm
+WITHDRAW_HOME_XY_M: float = 0.10
+WITHDRAW_HOME_Z_M: float = 0.05
+# 必须先离开初始位置，再至少向初始位置回撤 3cm
+RETURN_MIN_EXCURSION_M: float = 0.08
+RETURN_MIN_PROGRESS_M: float = 0.03
+RETURN_MAX_SEC: float = 10.0
+# 评分细则 E23 写“张开”，与关键术语中的“闭合”冲突；此处显式选择 E23。
+RETURN_GRIP_OPEN_REQUIRED: bool = True
 
 # =========================== 放置 ROI 阈值 ===========================
 
@@ -102,6 +111,19 @@ GRIP_CLOSE_THRESHOLD: float = 0.50
 GRIP_RELEASE_RISE: float = 0.15
 # 夹爪释放检测：抓取前必须闭合程度
 GRIP_PRE_CLOSE_MAX: float = 0.30
+# 夹爪完全闭合到此阈值通常表示空夹
+GRIP_EMPTY_CLOSED_MAX: float = 0.10
+
+# =========================== 轻量视觉阈值 ===========================
+
+VISION_SAMPLE_STRIDE: int = 6
+VISION_WIDTH: int = 320
+VISION_HEIGHT: int = 180
+VISION_MIN_OBJECT_PIXELS: int = 45
+VISION_MIN_BOX_PIXELS: int = 250
+VISION_PRESENT_RATE: float = 0.35
+VISION_OBJECT_MOTION_NORM: float = 0.02
+VISION_TOWARD_BOX_NORM: float = 0.03
 
 # =========================== 通用阈值 ===========================
 
@@ -118,36 +140,39 @@ DEFAULT_PLACE_CENTER: list[float] = [-0.077, 0.512, 0.168]
 
 RULES_TEXT: str = """
 ============================================================
-  机械臂抓取模型 自动评分规则（v5）
+  机械臂抓取模型 自动评分规则（v5 融合实现）
 ============================================================
 
 S1定位 (0-4):
-  0 = 10s内几乎没有动作         → has_motion=False
-  1 = 无规律乱动               → has_motion=True, approach_quality=wander/none
-  2 = 定位偏移                 → approach_quality=slow 且 >10s 或效率低
-  3 = 缓慢靠近目标（5-10s）    → approach_quality=slow, 5-10s
-  4 = 5s内快速准确定位         → approach_quality=fast
+  0 = 所有关节变化 <1° 且 EE 位移 <1cm
+  1 = 有移动但未形成有效靠近证据，或无目标物时仍移动
+  2 = 向目标区域靠近但未准确到位
+  3 = 5-10s 内到达可抓取区域
+  4 = 5s 内快速到达可抓取区域
+  注：缺少相机厘米级标定时，S1=3/4 自动标记人工复核
 
 S2抓取 (0-3):
-  0 = 未抓取                   → has_grasp_attempt=False
-  1 = 抓取失败（抓空）          → has_grasp_attempt=True, has_grasp_contact=False
-  2 = 抬起掉落                 → has_grasp_contact=True, has_grasp_object=False
-  3 = 稳定抓取                 → has_grasp_object=True (接触+运输)
+  0 = 无闭合事件，或视频确认没有目标物
+  1 = 执行闭合但空夹/物体未随动
+  2 = 有接触和短暂抬升，但未满足 5cm 稳定抓取
+  3 = 非空夹 + 物体随动 + 抬升≥5cm + 稳定运输
 
 S3搬运 (0-2):
-  0 = 未搬运                   → grasp_transport_m < 0.05m
-  1 = 搬运未到位               → grasp_transport_m ≥ 0.05m 但未到放置区
-  2 = 到达目标上方             → transport_to_place=True 且 retract_dist_m ≥ 0.10m
+  0 = 无稳定抓取、无搬运，或 OOD 场景无盒子
+  1 = 物体向盒子移动但未到盒口
+  2 = 物体到达盒口区域且未掉落
 
 S4投放 (0-3):
-  0 = 无投放                   → has_place_phase=False
-  1 = 落于盒外                 → has_place_phase=True, place_at_box=False (距ROI>2cm)
-  2 = 落于盒边                 → place_at_box=False 但距 ROI ≤ 2cm
-  3 = 准确入盒                 → place_at_box=True
+  0 = 未稳定抓取/未释放，或 OOD 场景无盒子
+  1 = 释放后物体在盒外
+  2 = 物体与盒边相交/卡边
+  3 = 物体整体位于盒内
 
 S5归位 (0-2):
-  0 = 未归位                   → has_retract=False
-  1 = 归位偏差                 → has_retract=True, withdraw_home_dist_m > 0.12m
-  2 = 成功归位                 → withdraw_home_dist_m ≤ 0.12m
+  0 = 未形成“离开初始位置→返回”的明确轨迹
+  1 = 有返回动作，但位置/时间/夹爪状态至少一项不达标
+  2 = xy≤10cm、z≤5cm、10s内完成且夹爪张开
+
+每个分数同时输出 confidence、evidence、needs_review，并写入 Excel 批注。
 ============================================================
 """

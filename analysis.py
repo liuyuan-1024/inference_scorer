@@ -14,24 +14,28 @@ from config import (
     APPROACH_XY_M,
     APPROACH_Z_DROP_M,
     FAST_APPROACH_FRAC,
-    FZ_CONTACT_MIN,
+    FZ_CONTACT_DELTA_MIN,
     GRASP_PHASE_WINDOW,
+    GRASP_LIFT_M,
     GRASP_TRANSPORT_M,
     GRIP_CLOSE_THRESHOLD,
+    GRIP_EMPTY_CLOSED_MAX,
     GRIP_OPEN_THRESHOLD,
-    GRIP_PRE_CLOSE_MAX,
-    GRIP_RELEASE_RISE,
     JC_CONTACT_DELTA,
     JC_GRASP_RISE_MIN,
     MIN_FRAMES,
-    MOTION_EE_PATH_M,
-    MOTION_JOINT_RAD,
+    MOTION_EE_EXCURSION_M,
+    MOTION_JOINT_EXCURSION_RAD,
     PATH_EFFICIENCY_MIN,
     PLACE_ROI_XY_M,
     PLACE_ROI_Z_M,
+    RETURN_MIN_EXCURSION_M,
+    RETURN_MIN_PROGRESS_M,
     RETRACT_DIST_M,
     RETRACT_Z_RISE_M,
-    WITHDRAW_HOME_M,
+    VISION_OBJECT_MOTION_NORM,
+    WITHDRAW_HOME_XY_M,
+    WITHDRAW_HOME_Z_M,
 )
 from models import TaskJudgment, TaskSignals
 
@@ -66,15 +70,18 @@ def detect_grasp_event(t: TaskSignals) -> tuple[int | None, str | None]:
         valid_grip = grip[valid_mask]
         valid_idx = np.where(valid_mask)[0]
 
-        # 找首次 grip 从"张开"(>0.7) 下降到"闭合"(<0.5) 的帧并且下降幅度 > 0.3（排除噪声）
-        for i in range(len(valid_grip) - 1):
-            if (
-                valid_grip[i] > GRIP_OPEN_THRESHOLD
-                and valid_grip[i + 1] < GRIP_CLOSE_THRESHOLD
-                and valid_grip[i] - valid_grip[i + 1] > 0.3
-            ):
-                frame = valid_idx[i + 1]
-                return frame, "grip"
+        # 夹爪通常在数帧内渐进闭合，不能只匹配相邻两帧的大跳变。
+        # 要求当前已闭合，且最近 12 个有效样本中曾明确张开。
+        seen_open = valid_grip[0] > GRIP_OPEN_THRESHOLD
+        for i in range(1, len(valid_grip)):
+            seen_open = seen_open or valid_grip[i - 1] > GRIP_OPEN_THRESHOLD
+            if valid_grip[i] >= GRIP_CLOSE_THRESHOLD:
+                continue
+            if seen_open:
+                return int(valid_idx[i]), "grip"
+
+        # 已有可靠夹爪反馈却没有闭合，不再用关节电流/最低点伪造抓取事件。
+        return None, None
 
     # --- 策略 2：关节电流尖峰检测 ---
     # 忽略前 5 帧的初始化冲击（机器人复位/启动时 JC 可能短暂偏高）
@@ -112,6 +119,10 @@ def analyze_grasp_signals(t: TaskSignals) -> None:
 
     if gp is None:
         return
+    if len(t.frame_times) == n and n:
+        t.grasp_time_sec = float(t.frame_times[gp] - t.frame_times[0])
+    else:
+        t.grasp_time_sec = float(gp) / 15.0
 
     # --- 抓取窗口 ---
     lo = max(0, gp - 3)
@@ -126,6 +137,18 @@ def analyze_grasp_signals(t: TaskSignals) -> None:
     t.jc_grasp_rise = t.jc_at_grasp - pre_jc
     t.jc_pre_close = pre_jc
     t.jc_close_rise = t.jc_grasp_rise
+    if len(t.jc_joint_traj):
+        baseline_end = max(1, lo)
+        jc_baseline = np.median(t.jc_joint_traj[:baseline_end], axis=0)
+        t.jc_contact_delta = float(
+            np.max(np.abs(t.jc_joint_traj[win] - jc_baseline))
+        )
+    else:
+        t.jc_contact_delta = max(0.0, t.jc_grasp_rise)
+    if len(fz):
+        baseline_end = max(1, lo)
+        fz_baseline = float(np.median(fz[:baseline_end]))
+        t.fz_contact_delta = float(np.max(np.abs(fz[win] - fz_baseline)))
 
     # --- 抓取点 EE 位姿 ---
     t.ee_at_grasp = ee[gp].tolist() if gp < n else []
@@ -144,8 +167,15 @@ def analyze_grasp_signals(t: TaskSignals) -> None:
     elif len(ee):
         t.ee_at_place = ee[-1].tolist()
 
-    # --- 夹爪释放检测 ---
+    # --- 夹爪释放与空夹检测 ---
     _detect_grip_release(t)
+    if len(grip):
+        closed_end = t.grip_release_frame or min(len(grip), gp + 40)
+        closed = grip[gp:closed_end]
+        closed = closed[~np.isnan(closed)]
+        if len(closed):
+            t.grip_closed_min = float(closed.min())
+            t.grip_empty_close = t.grip_closed_min <= GRIP_EMPTY_CLOSED_MAX
 
 
 def _detect_grip_release(t: TaskSignals) -> None:
@@ -160,34 +190,17 @@ def _detect_grip_release(t: TaskSignals) -> None:
     if valid_mask.sum() < 5:
         return
 
-    # 抓取前的夹爪均值（排除前几帧的初始化动作）
-    pre_win = grip[max(3, gp - 10) : gp + 1]
-    pre_valid = pre_win[~np.isnan(pre_win)]
-    if len(pre_valid) == 0:
-        return
-    pre_grip = float(pre_valid.mean())
-
-    # 抓取后的夹爪最大值
-    post_win = grip[gp : min(len(grip), gp + 40)]
-    post_valid = post_win[~np.isnan(post_win)]
-    if len(post_valid) == 0:
-        return
-    post_grip = float(post_valid.max())
-
-    # 释放条件：抓取前处于闭合状态，抓取后明显张开
-    if pre_grip < GRIP_PRE_CLOSE_MAX and post_grip > pre_grip + GRIP_RELEASE_RISE:
-        # 排除最小值在第 0 帧（初始化张开）
-        valid_grip = grip[valid_mask]
-        valid_idx = np.where(valid_mask)[0]
-        min_valid_idx = int(valid_idx[np.argmin(valid_grip)])
-        if min_valid_idx > 2:
+    # 抓取帧已由“张开→闭合”确定；之后首次重新越过张开阈值即为释放。
+    release_candidates = np.where(
+        (grip > GRIP_OPEN_THRESHOLD) & (np.arange(len(grip)) > gp)
+    )[0]
+    if len(release_candidates):
+        release = int(release_candidates[0])
+        # 至少维持两帧闭合，排除单帧抖动。
+        held = grip[gp : min(release, gp + 3)]
+        if np.sum(held < GRIP_CLOSE_THRESHOLD) >= 2:
             t.grip_release_detected = True
-            # 找首次张开到 > 0.5 的帧
-            release_candidates = np.where(
-                (grip > pre_grip + GRIP_RELEASE_RISE) & (np.arange(len(grip)) >= gp)
-            )[0]
-            if len(release_candidates):
-                t.grip_release_frame = int(release_candidates[0])
+            t.grip_release_frame = release
 
 
 # ===================================================================
@@ -231,18 +244,29 @@ def analyze_motion_phases(t: TaskSignals, *, place_center: np.ndarray) -> None:
     disp_xy = ee_at_min_z[:2] - ee_start[:2]
     t.approach_xy_m = float(np.linalg.norm(disp_xy))
 
-    # 方向对齐度量
-    if t.approach_xy_m > 0.01:
-        # 用 xy 位移方向作为对齐的代理（首帧→z最低点的方向）
-        t.approach_align = min(1.0, t.approach_xy_m / 0.10)
-    else:
-        t.approach_align = 0.0
-
     # 路径效率
     path_len = float(np.linalg.norm(np.diff(pre_ee, axis=0), axis=1).sum())
     straight = float(np.linalg.norm(ee_at_min_z - ee_start))
     t.path_efficiency = straight / path_len if path_len > 1e-6 else 0.0
+    # 未标定物体三维坐标时，以路径直线度作为保守代理，并在审计结果中降置信度。
+    t.approach_align = t.path_efficiency
     t.approach_frame_frac = min_z_idx / max(pre_end - 1, 1)
+
+    # --- 相对任务起始位姿的归位指标（不依赖是否抓取） ---
+    home_delta = ee - ee[0]
+    home_dists = np.linalg.norm(home_delta, axis=1)
+    max_home_idx = int(np.argmax(home_dists))
+    t.max_home_excursion_m = float(home_dists[max_home_idx])
+    t.home_xy_error_m = float(np.linalg.norm(home_delta[-1, :2]))
+    t.home_z_error_m = float(abs(home_delta[-1, 2]))
+    final_home_dist = float(home_dists[-1])
+    t.return_progress_m = max(0.0, t.max_home_excursion_m - final_home_dist)
+    if max_home_idx < n - 1:
+        if len(t.frame_times) == n:
+            t.return_duration_sec = float(t.frame_times[-1] - t.frame_times[max_home_idx])
+        else:
+            t.return_duration_sec = float(n - 1 - max_home_idx) / 15.0
+    t.withdraw_home_dist_m = final_home_dist
 
     # --- 撤回阶段 ---
     if grasp_idx is not None and grasp_idx < n - 1:
@@ -254,8 +278,6 @@ def analyze_motion_phases(t: TaskSignals, *, place_center: np.ndarray) -> None:
         t.retract_z_rise_m = (
             float(post_ee[:, 2].max() - grasp_ee[2]) if len(post_ee) else 0.0
         )
-        t.withdraw_home_dist_m = float(np.linalg.norm(ee[-1] - ee_start))
-
         # 运输方向对齐放置 ROI
         if len(post_ee) >= 2:
             to_place = place_center[:2] - grasp_ee[:2]
@@ -277,9 +299,9 @@ def analyze_motion_phases(t: TaskSignals, *, place_center: np.ndarray) -> None:
 
 def detect_motion(t: TaskSignals) -> bool:
     """判定机械臂是否有效移动。"""
-    if t.ee_path_m >= MOTION_EE_PATH_M:
+    if t.max_ee_excursion_m >= MOTION_EE_EXCURSION_M:
         return True
-    if t.joint_delta_rad >= MOTION_JOINT_RAD:
+    if t.max_joint_excursion_rad >= MOTION_JOINT_EXCURSION_RAD:
         return True
     return False
 
@@ -334,7 +356,7 @@ def detect_grasp_attempt(t: TaskSignals, has_motion: bool) -> bool:
 
 
 def judge_task_simple(
-    t: TaskSignals, *, place_center: np.ndarray, jc_baseline: float
+    t: TaskSignals, *, place_center: np.ndarray, jc_baseline: float | None = None
 ) -> TaskJudgment:
     """对单个 task 做综合语义判定（不依赖首帧视频）。"""
     analyze_motion_phases(t, place_center=place_center)
@@ -343,27 +365,49 @@ def judge_task_simple(
     has_grasp_attempt = detect_grasp_attempt(t, has_motion)
 
     # --- 接触 / 抓取判定 ---
-    abs_ok = t.jc_at_grasp >= jc_baseline + JC_CONTACT_DELTA
-    rel_ok = t.jc_grasp_rise >= JC_GRASP_RISE_MIN
-    fz_ok = t.fz_spike_grasp >= FZ_CONTACT_MIN
+    jc_ok = t.jc_contact_delta >= JC_CONTACT_DELTA
+    fz_ok = t.fz_contact_delta >= FZ_CONTACT_DELTA_MIN
     transport_ok = t.grasp_transport_m >= GRASP_TRANSPORT_M
-    has_load = abs_ok or rel_ok or fz_ok
+    lift_ok = t.retract_z_rise_m >= GRASP_LIFT_M
+    visual_motion = (
+        t.vision.available
+        and t.vision.object_motion_after_grasp_norm >= VISION_OBJECT_MOTION_NORM
+    )
+    sensor_contact = jc_ok and fz_ok
+
+    # OOD“有盒无物”中的闭合动作不能算作抓取。
+    if t.vision.available and t.vision.object_present is False:
+        has_grasp_attempt = False
 
     if not has_grasp_attempt:
         has_grasp_contact = False
         has_grasp_object = False
     else:
-        has_grasp_contact = has_load
-        has_grasp_object = has_load or (transport_ok and has_load)
+        has_grasp_contact = not t.grip_empty_close and (visual_motion or sensor_contact)
+        has_grasp_object = (
+            has_grasp_contact
+            and transport_ok
+            and lift_ok
+            and (visual_motion if t.vision.available else sensor_contact)
+        )
 
     # --- 放置相位 ---
-    has_place_phase = False
-    place_at_box = False
-    if has_grasp_object:
-        has_place_phase = (
-            t.grasp_transport_m >= 0.03
-            or t.retract_dist_m >= RETRACT_DIST_M * 0.5
-            or t.transport_to_place
+    if t.vision.available:
+        t.transport_to_place = t.vision.moved_toward_box
+    has_place_phase = bool(
+        t.grip_release_detected
+        and (t.vision.box_present is not False)
+        and has_grasp_object
+    )
+    place_at_box = t.vision.final_object_relation == "inside"
+    if not t.vision.available and has_grasp_object:
+        has_place_phase = bool(
+            t.grip_release_detected
+            and (
+                t.grasp_transport_m >= 0.03
+                or t.retract_dist_m >= RETRACT_DIST_M * 0.5
+                or t.transport_to_place
+            )
         )
         if has_place_phase and t.ee_at_place:
             ee = np.array(t.ee_at_place)
@@ -384,7 +428,12 @@ def judge_task_simple(
     has_retract = (
         t.retract_dist_m >= RETRACT_DIST_M or t.retract_z_rise_m >= RETRACT_Z_RISE_M
     )
-    has_withdraw = t.withdraw_home_dist_m <= WITHDRAW_HOME_M
+    has_withdraw = (
+        t.max_home_excursion_m >= RETURN_MIN_EXCURSION_M
+        and t.return_progress_m >= RETURN_MIN_PROGRESS_M
+        and t.home_xy_error_m <= WITHDRAW_HOME_XY_M
+        and t.home_z_error_m <= WITHDRAW_HOME_Z_M
+    )
 
     if has_grasp_contact and has_place_phase and (place_at_box or t.transport_to_place):
         retract_semantic = "transport_place"
@@ -413,7 +462,20 @@ def judge_task_simple(
     if has_withdraw:
         parts.append(f"归位({t.withdraw_home_dist_m:.3f}m)")
 
+    evidence = list(t.vision.notes)
+    if t.grip_empty_close:
+        evidence.append(f"夹爪闭合至{t.grip_closed_min:.3f}，判为空夹")
+    if t.grasp_phase_idx is not None:
+        evidence.append(
+            f"抓取候选帧={t.grasp_phase_idx}({t.grasp_detected_by or '?'})"
+        )
+    evidence.append(
+        f"接触残差: ΔJC={t.jc_contact_delta:.0f}, ΔFz={t.fz_contact_delta:.2f}N"
+    )
     reason = "；".join(parts) if parts else "信号不足"
+    confidence = t.vision.confidence if t.vision.available else 0.45
+    if t.grip_empty_close or (t.vision.available and t.vision.object_present is False):
+        confidence = max(confidence, 0.85)
 
     return TaskJudgment(
         task_index=t.task_index,
@@ -431,6 +493,7 @@ def judge_task_simple(
         n_frames=t.n_frames,
         reason=reason,
         grip_release_detected=t.grip_release_detected,
+        grasp_time_sec=t.grasp_time_sec,
         ee_path_m=t.ee_path_m,
         joint_delta_rad=t.joint_delta_rad,
         approach_z_drop_m=t.approach_z_drop_m,
@@ -446,6 +509,21 @@ def judge_task_simple(
         retract_z_rise_m=t.retract_z_rise_m,
         withdraw_home_dist_m=t.withdraw_home_dist_m,
         transport_to_place=t.transport_to_place,
+        home_xy_error_m=t.home_xy_error_m,
+        home_z_error_m=t.home_z_error_m,
+        max_home_excursion_m=t.max_home_excursion_m,
+        return_progress_m=t.return_progress_m,
+        return_duration_sec=t.return_duration_sec,
+        grip_final_val=t.grip_final_val,
+        grip_empty_close=t.grip_empty_close,
+        vision_available=t.vision.available,
+        scenario=t.vision.scenario,
+        object_present=t.vision.object_present,
+        box_present=t.vision.box_present,
+        object_motion_norm=t.vision.object_motion_after_grasp_norm,
+        final_object_relation=t.vision.final_object_relation,
+        confidence=confidence,
+        evidence=evidence,
     )
 
 
@@ -460,7 +538,7 @@ def learn_place_center(signals: list[TaskSignals]) -> np.ndarray:
 
     取有负载运输的 task 的终点位置的中位数。
     """
-    from config import GRASP_TRANSPORT_M, PLACE_ROI_XY_M, PLACE_ROI_Z_M
+    from config import GRASP_TRANSPORT_M
 
     place_ee = []
     for t in signals:
@@ -558,20 +636,23 @@ def analyze_data_dir(data_dir: Path) -> list[TaskJudgment]:
         if gp is not None:
             analyze_grasp_signals(t)
 
-    # --- 学习放置 ROI ---
-    place_center = learn_place_center(raw_signals)
-    place_tol = learn_place_tolerance(raw_signals, place_center)
+    # --- 附加视频语义证据 ---
+    from vision import attach_vision_evidence
 
-    # --- 学习 JC 基线 ---
-    jc_baseline = learn_jc_baseline(raw_signals)
+    attach_vision_evidence(data_dir, raw_signals)
+
+    # 不再从失败任务终点反向“学习”盒子位置，避免循环污染。
+    from config import DEFAULT_PLACE_CENTER
+
+    place_center = np.array(DEFAULT_PLACE_CENTER)
+    place_tol = np.array([PLACE_ROI_XY_M, PLACE_ROI_XY_M, PLACE_ROI_Z_M])
 
     print(
         f"  place_center=({place_center[0]:.4f}, {place_center[1]:.4f}, {place_center[2]:.4f})"
     )
     print(f"  place_tol=({place_tol[0]:.4f}, {place_tol[1]:.4f}, {place_tol[2]:.4f})")
-    print(f"  jc_baseline={jc_baseline:.0f}")
 
     return [
-        judge_task_simple(t, place_center=place_center, jc_baseline=jc_baseline)
+        judge_task_simple(t, place_center=place_center)
         for t in sorted(raw_signals, key=lambda x: x.task_index)
     ]

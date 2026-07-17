@@ -95,13 +95,23 @@ def ingest_eval_log(
         jp_list = (rs.get("joint_position") or {}).get("left_arm") or []
 
         if seg not in by_seg:
-            by_seg[seg] = {"ee": [], "grip": [], "jc": [], "fz": [], "jp": []}
+            by_seg[seg] = {
+                "ee": [],
+                "grip": [],
+                "jc": [],
+                "jc_joint": [],
+                "fz": [],
+                "jp": [],
+                "time": [],
+            }
         d = by_seg[seg]
         d["ee"].append(ee)
         d["grip"].append(grip if grip is not None else np.nan)
         d["jc"].append(jc)
+        d["jc_joint"].append(jc_list)
         d["fz"].append(fz)
         d["jp"].append(jp_list)
+        d["time"].append(float(o.get("wall_time", fi)))
 
     out: dict[int, TaskSignals] = {}
     for seg, d in by_seg.items():
@@ -109,9 +119,15 @@ def ingest_eval_log(
         grip = np.array(d["grip"], dtype=float)
         jc = np.array(d["jc"], dtype=float)
         fz = np.array(d["fz"], dtype=float)
+        frame_times = np.array(d["time"], dtype=float)
         jp = (
             np.array(d["jp"], dtype=float)
             if d["jp"] and d["jp"][0]
+            else np.empty((0, 7))
+        )
+        jc_joint = (
+            np.array(d["jc_joint"], dtype=float)
+            if d["jc_joint"] and d["jc_joint"][0]
             else np.empty((0, 7))
         )
 
@@ -119,14 +135,23 @@ def ingest_eval_log(
         t.ee_traj = ee
         t.fz_traj = fz
         t.jc_traj = jc
+        t.jc_joint_traj = jc_joint
         t.grip_traj = grip
+        t.joint_traj = jp
+        t.frame_times = frame_times
+        if len(frame_times) >= 2:
+            t.duration_sec = float(frame_times[-1] - frame_times[0])
 
         if len(ee):
             t.ee_start = ee[0].tolist()
         if len(ee) >= 2:
             t.ee_path_m = float(np.linalg.norm(np.diff(ee, axis=0), axis=1).sum())
+            t.max_ee_excursion_m = float(
+                np.linalg.norm(ee - ee[0], axis=1).max()
+            )
         if len(jp) >= 2:
             t.joint_delta_rad = float(np.abs(np.diff(jp, axis=0)).sum())
+            t.max_joint_excursion_rad = float(np.abs(jp - jp[0]).max())
 
         t.jc_max = float(jc.max()) if len(jc) else 0.0
 
@@ -136,6 +161,7 @@ def ingest_eval_log(
             if len(valid) > 0:
                 t.grip_min_val = float(valid.min())
                 t.grip_max_val = float(valid.max())
+                t.grip_final_val = float(valid[-1])
 
         out[seg] = t
     return out

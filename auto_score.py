@@ -7,12 +7,11 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
-
 from config import DEFAULT_FPS, EXCEL_FILENAME
 from analysis import analyze_data_dir
 from excel_io import fill_excel, print_rules
-from scoring import compute_all_scores
+from loader import load_meta
+from scoring import compute_score_details
 
 
 def print_judgments(judgments: list) -> None:
@@ -60,8 +59,6 @@ def print_score_table(scores: dict[int, dict[str, int]]) -> None:
     """打印评分表（行为维度，列为 task，与 Excel 布局一致）。"""
     DIMS = ["S1定位", "S2抓取", "S3搬运", "S4投放", "S5归位"]
     task_ids = sorted(scores.keys())
-    col_width = 8
-
     # 表头
     header = f"{'维度':>6}  "
     header += "  ".join(f"{f'test{t}':>6}" for t in task_ids)
@@ -86,7 +83,36 @@ def print_score_table(scores: dict[int, dict[str, int]]) -> None:
     print(total_line)
 
 
-def save_summary(data_dir: Path, judgments: list, scores: dict) -> None:
+def print_review_items(score_details: dict[int, dict[str, dict]]) -> int:
+    """打印需要人工复核的具体 task、维度和原因。"""
+    review_items = []
+    for task_idx in sorted(score_details):
+        for dim_name, detail in score_details[task_idx].items():
+            if not detail.get("needs_review"):
+                continue
+            review_items.append((task_idx, dim_name, detail))
+
+    if not review_items:
+        print("\n无需人工复核。")
+        return 0
+
+    print(f"\n待人工复核明细（{len(review_items)} 项）:")
+    for task_idx, dim_name, detail in review_items:
+        confidence = float(detail.get("confidence", 0.0))
+        reason = detail.get("review_reason") or "评分置信度不足"
+        print(
+            f"  - test{task_idx} / {dim_name} "
+            f"(置信度 {confidence:.0%}): {reason}"
+        )
+    return len(review_items)
+
+
+def save_summary(
+    data_dir: Path,
+    judgments: list,
+    scores: dict,
+    score_details: dict,
+) -> None:
     """保存评分摘要 JSON。"""
     summary_path = data_dir / "auto_score_summary.json"
     summary = {
@@ -94,6 +120,11 @@ def save_summary(data_dir: Path, judgments: list, scores: dict) -> None:
         "n_tasks": len(judgments),
         "n_scored": len(scores),
         "scores": {},
+        "review_count": sum(
+            int(item.get("needs_review", False))
+            for dims in score_details.values()
+            for item in dims.values()
+        ),
         "judgments": [
             {
                 "task_index": j.task_index,
@@ -102,13 +133,24 @@ def save_summary(data_dir: Path, judgments: list, scores: dict) -> None:
                 "has_place_phase": j.has_place_phase,
                 "place_at_box": j.place_at_box,
                 "approach_quality": j.approach_quality,
+                "scenario": j.scenario,
+                "vision_available": j.vision_available,
+                "object_present": j.object_present,
+                "box_present": j.box_present,
+                "final_object_relation": j.final_object_relation,
+                "confidence": j.confidence,
+                "evidence": j.evidence,
                 "reason": j.reason,
             }
             for j in judgments
         ],
     }
     for tid, ds in scores.items():
-        summary["scores"][str(tid)] = {"scores": ds, "total": sum(ds.values())}
+        summary["scores"][str(tid)] = {
+            "scores": ds,
+            "total": sum(ds.values()),
+            "details": score_details[tid],
+        }
 
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -198,24 +240,31 @@ def main() -> int:
 
     # --- Step 2: 计算评分 ---
     print("\n正在计算评分...")
-    scores = compute_all_scores(judgments, args.fps)
+    score_details = compute_score_details(judgments, args.fps)
+    scores = {
+        task_idx: {dim: int(item["score"]) for dim, item in dims.items()}
+        for task_idx, dims in score_details.items()
+    }
     print_score_table(scores)
+    print_review_items(score_details)
 
     # --- Step 3: 写入 Excel ---
     print("\n正在写入 Excel...")
-    fill_excel(excel_path, excel_path, scores)
+    meta = load_meta(data_dir)
+    metadata = {
+        **meta,
+        "video_path": str(data_dir / "videos"),
+    }
+    fill_excel(
+        excel_path,
+        excel_path,
+        scores,
+        score_details=score_details,
+        metadata=metadata,
+    )
 
     # --- Step 4: 输出摘要 JSON ---
-    save_summary(data_dir, judgments, scores)
-
-    # 汇总统计
-    totals = [sum(scores[t].values()) for t in sorted(scores.keys())]
-    print(f"\n{'=' * 50}")
-    print(f"完成! 共评分 {len(scores)} 个 task")
-    if totals:
-        print(f"   平均总分: {np.mean(totals):.1f} / 14.0")
-        print(f"   最高分: {max(totals)}  最低分: {min(totals)}")
-    print(f"   输出文件: {excel_path}")
+    save_summary(data_dir, judgments, scores, score_details)
 
     return 0
 
