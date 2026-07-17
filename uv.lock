@@ -20,7 +20,7 @@ wheels = [
 ]
 
 [[package]]
-name = "judge-real-robot-trial-semantics"
+name = "inference-scorer"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
