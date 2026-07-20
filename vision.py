@@ -1,217 +1,86 @@
-"""
-轻量视频证据提取。
-
-使用 OpenCV 精确读取任务帧，通过 HSV 分割、形态学去噪和轮廓分析识别
-红色玩具与黄色盒子。视觉结果用于否决明显误判，并为低置信度样本提供
-人工复核线索；它不是通用目标检测器。
-"""
+"""基于真实时间戳的胸前 / 腕部多视角视频证据提取。"""
 
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 from config import (
-    VISION_HEIGHT,
     VISION_MIN_BOX_PIXELS,
     VISION_MIN_OBJECT_PIXELS,
     VISION_PRESENT_RATE,
-    VISION_SAMPLE_STRIDE,
+    VISION_SETTLE_WINDOW_SEC,
+    VISION_SETTLE_MOTION_NORM,
     VISION_TOWARD_BOX_NORM,
-    VISION_WIDTH,
+    VISION_WRIST_GRIPPER_X_NORM,
+    VISION_WRIST_GRIPPER_Y_NORM,
+    VISION_WRIST_NEAR_GRIPPER_NORM,
+    VISION_WRIST_RETAIN_RATE,
 )
 from models import TaskSignals, VisionEvidence
+from video_io import (
+    DecodedFrames,
+    decode_selected_frames,
+    load_camera_frame_timestamps,
+    load_task_video_ranges,
+    select_frame_indices,
+)
+from vision_cv import (
+    box_relation,
+    distance,
+    red_mask,
+    track_motion_norm,
+    track_observations,
+    yellow_mask,
+)
+
+__all__ = [
+    "analyze_chest_frames",
+    "analyze_wrist_frames",
+    "attach_vision_evidence",
+]
 
 
-def load_task_video_ranges(
-    data_dir: Path, camera_key: str = "cam_mid"
-) -> dict[int, tuple[int, int]]:
-    """从 task_segments.jsonl 读取每个任务对应的视频帧范围。"""
-    path = data_dir / "task_segments.jsonl"
-    if not path.is_file():
-        return {}
-
-    boundaries: dict[int, dict[str, int]] = {}
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            if item.get("type") != "task_boundary":
-                continue
-            task_idx = item.get("task_segment_index")
-            event = item.get("event")
-            frame_count = (item.get("video_frame_counts") or {}).get(camera_key)
-            if task_idx is None or event not in {"start", "end"} or frame_count is None:
-                continue
-            boundaries.setdefault(int(task_idx), {})[event] = int(frame_count)
-
-    ranges: dict[int, tuple[int, int]] = {}
-    for task_idx, values in boundaries.items():
-        if "start" not in values or "end" not in values:
-            continue
-        start = values["start"]
-        end = values["end"] - 1
-        if end >= start:
-            ranges[task_idx] = (start, end)
-    return ranges
-
-
-def _decode_sampled_frames(
-    video_path: Path,
-    start_frame: int,
-    end_frame: int,
+def _event_index(
+    timestamps: np.ndarray,
+    event_timestamp: float | None,
     *,
-    stride: int = VISION_SAMPLE_STRIDE,
-    width: int = VISION_WIDTH,
-    height: int = VISION_HEIGHT,
-) -> np.ndarray:
-    """按帧号抽样并返回 RGB 帧；失败时返回空数组。"""
-    if not video_path.is_file():
-        return np.empty((0, height, width, 3), dtype=np.uint8)
-
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        return np.empty((0, height, width, 3), dtype=np.uint8)
-
-    capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    frames: list[np.ndarray] = []
-    frame_idx = start_frame
-    sample_stride = max(1, stride)
-    try:
-        while frame_idx <= end_frame:
-            ok, bgr = capture.read()
-            if not ok:
-                break
-            if (frame_idx - start_frame) % sample_stride == 0:
-                resized = cv2.resize(
-                    bgr, (width, height), interpolation=cv2.INTER_AREA
-                )
-                frames.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
-            frame_idx += 1
-    finally:
-        capture.release()
-
-    if not frames:
-        return np.empty((0, height, width, 3), dtype=np.uint8)
-    return np.stack(frames)
+    fallback_fraction: float | None,
+    n_frames: int,
+) -> int:
+    if (
+        event_timestamp is not None
+        and len(timestamps)
+        and np.isfinite(timestamps).any()
+    ):
+        valid = np.where(np.isfinite(timestamps))[0]
+        return int(valid[np.argmin(np.abs(timestamps[valid] - event_timestamp))])
+    if fallback_fraction is not None:
+        return max(0, min(n_frames - 1, round(fallback_fraction * (n_frames - 1))))
+    return 0
 
 
-def _red_mask(frame: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-    low_red = cv2.inRange(
-        hsv,
-        np.array([0, 95, 38], dtype=np.uint8),
-        np.array([12, 255, 255], dtype=np.uint8),
-    )
-    high_red = cv2.inRange(
-        hsv,
-        np.array([168, 95, 38], dtype=np.uint8),
-        np.array([179, 255, 255], dtype=np.uint8),
-    )
-    return _clean_mask(cv2.bitwise_or(low_red, high_red))
-
-
-def _yellow_mask(frame: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-    yellow = cv2.inRange(
-        hsv,
-        np.array([14, 80, 45], dtype=np.uint8),
-        np.array([42, 255, 255], dtype=np.uint8),
-    )
-    return _clean_mask(yellow)
-
-
-def _clean_mask(mask: np.ndarray) -> np.ndarray:
-    """去除高光噪点并连接目标内部的小孔洞。"""
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
-    return cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_kernel)
-
-
-def _mask_observation(
-    mask: np.ndarray, min_pixels: int
-) -> tuple[tuple[float, float] | None, tuple[int, int, int, int] | None, int]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, None, 0
-    contour = max(contours, key=cv2.contourArea)
-    count = int(round(cv2.contourArea(contour)))
-    if count < min_pixels:
-        return None, None, count
-    moments = cv2.moments(contour)
-    if abs(moments["m00"]) < 1e-6:
-        return None, None, count
-    centroid = (
-        float(moments["m10"] / moments["m00"]),
-        float(moments["m01"] / moments["m00"]),
-    )
-    x, y, width, height = cv2.boundingRect(contour)
-    bbox = (x, y, x + width - 1, y + height - 1)
-    return centroid, bbox, count
-
-
-def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
-    return math.hypot(a[0] - b[0], a[1] - b[1])
-
-
-def _rect_relation(
-    obj: tuple[int, int, int, int] | None,
-    box: tuple[int, int, int, int] | None,
-) -> str:
-    if obj is None or box is None:
-        return "unknown"
-    ox1, oy1, ox2, oy2 = obj
-    bx1, by1, bx2, by2 = box
-    margin = 3
-    inside = (
-        ox1 >= bx1 + margin
-        and oy1 >= by1 + margin
-        and ox2 <= bx2 - margin
-        and oy2 <= by2 - margin
-    )
-    if inside:
-        return "inside"
-    intersects = max(ox1, bx1) <= min(ox2, bx2) and max(oy1, by1) <= min(oy2, by2)
-    return "edge" if intersects else "outside"
-
-
-def analyze_frames(
-    frames: np.ndarray, *, grasp_fraction: float | None = None
+def analyze_chest_frames(
+    decoded: DecodedFrames,
+    *,
+    grasp_timestamp: float | None = None,
+    release_timestamp: float | None = None,
+    grasp_fraction: float | None = None,
 ) -> VisionEvidence:
-    """分析已抽样的 RGB 帧。公开此函数便于合成数据单元测试。"""
+    frames = decoded.frames
     if len(frames) == 0:
-        return VisionEvidence(notes=["未读取到视频帧"])
+        return VisionEvidence(notes=["胸前相机未读取到视频帧"])
 
-    object_centers: list[tuple[float, float] | None] = []
-    object_boxes: list[tuple[int, int, int, int] | None] = []
-    box_centers: list[tuple[float, float] | None] = []
-    box_boxes: list[tuple[int, int, int, int] | None] = []
-
-    for frame in frames:
-        object_center, object_box, _ = _mask_observation(
-            _red_mask(frame), VISION_MIN_OBJECT_PIXELS
-        )
-        box_center, box_box, _ = _mask_observation(
-            _yellow_mask(frame), VISION_MIN_BOX_PIXELS
-        )
-        object_centers.append(object_center)
-        object_boxes.append(object_box)
-        box_centers.append(box_center)
-        box_boxes.append(box_box)
-
+    objects = track_observations(frames, red_mask, VISION_MIN_OBJECT_PIXELS)
+    boxes = track_observations(frames, yellow_mask, VISION_MIN_BOX_PIXELS)
     n = len(frames)
-    early_n = max(3, n // 4)
-    object_rate = sum(x is not None for x in object_centers[:early_n]) / early_n
-    box_rate = sum(x is not None for x in box_centers[:early_n]) / early_n
+    early_n = max(1, min(n, max(3, n // 4)))
+    object_rate = sum(item is not None for item in objects[:early_n]) / early_n
+    box_rate = sum(item is not None for item in boxes[:early_n]) / early_n
     object_present = object_rate >= VISION_PRESENT_RATE
     box_present = box_rate >= VISION_PRESENT_RATE
-
     if object_present and box_present:
         scenario = "normal"
     elif object_present:
@@ -222,75 +91,98 @@ def analyze_frames(
         scenario = "empty_or_unrecognized"
 
     diagonal = math.hypot(frames.shape[2], frames.shape[1])
-    valid_object = [(i, p) for i, p in enumerate(object_centers) if p is not None]
-    object_motion = 0.0
-    if valid_object:
-        origin = valid_object[0][1]
-        object_motion = max(_distance(origin, p) for _, p in valid_object) / diagonal
-
-    close_idx = 0
-    if grasp_fraction is not None:
-        close_idx = max(0, min(n - 1, round(grasp_fraction * (n - 1))))
-    close_candidates = [(i, p) for i, p in valid_object if i <= close_idx]
-    if close_candidates:
-        close_origin = close_candidates[-1][1]
-    elif valid_object:
-        close_origin = valid_object[0][1]
-    else:
-        close_origin = None
-    post_object = [p for i, p in valid_object if i >= close_idx]
-    motion_after_grasp = (
-        max(_distance(close_origin, p) for p in post_object) / diagonal
-        if close_origin is not None and post_object
-        else 0.0
+    grasp_idx = _event_index(
+        decoded.timestamps,
+        grasp_timestamp,
+        fallback_fraction=grasp_fraction,
+        n_frames=n,
     )
+    release_idx = _event_index(
+        decoded.timestamps,
+        release_timestamp,
+        fallback_fraction=None,
+        n_frames=n,
+    )
+    valid_indices = [i for i, item in enumerate(objects) if item is not None]
+    object_motion = track_motion_norm(objects, valid_indices, diagonal)
+    post_indices = [i for i in valid_indices if i >= grasp_idx]
+    motion_after_grasp = track_motion_norm(objects, post_indices, diagonal)
 
     distance_drop = 0.0
-    initial_pairs = [
-        (object_centers[i], box_centers[i])
-        for i in range(min(early_n, n))
-        if object_centers[i] is not None and box_centers[i] is not None
+    initial_distances = [
+        distance(objects[i].centroid, boxes[i].centroid)
+        for i in range(early_n)
+        if objects[i] is not None and boxes[i] is not None
     ]
-    post_pairs = [
-        (object_centers[i], box_centers[i])
-        for i in range(close_idx, n)
-        if object_centers[i] is not None and box_centers[i] is not None
+    post_distances = [
+        distance(objects[i].centroid, boxes[i].centroid)
+        for i in range(grasp_idx, n)
+        if objects[i] is not None and boxes[i] is not None
     ]
-    if initial_pairs and post_pairs:
-        initial_distance = float(
-            np.median([_distance(obj, box) for obj, box in initial_pairs])
+    if initial_distances and post_distances:
+        distance_drop = max(
+            0.0, float(np.median(initial_distances)) - min(post_distances)
+        ) / diagonal
+
+    final_start = release_idx if release_timestamp is not None else max(0, n - max(3, n // 5))
+    final_candidates: list[tuple[str, float, int]] = []
+    for i in range(final_start, n):
+        relation, ratio = box_relation(objects[i], boxes[i])
+        if relation != "unknown":
+            final_candidates.append((relation, ratio, i))
+    if final_candidates:
+        final_relation, final_ratio, _ = final_candidates[-1]
+    else:
+        final_relation, final_ratio = "unknown", 0.0
+
+    settle_indices = [
+        i
+        for i in range(final_start, n)
+        if objects[i] is not None
+        and (
+            release_timestamp is None
+            or not np.isfinite(decoded.timestamps[i])
+            or (
+                release_timestamp + 0.15 <= decoded.timestamps[i]
+                <= release_timestamp + 0.15 + VISION_SETTLE_WINDOW_SEC
+            )
         )
-        closest_after = min(_distance(obj, box) for obj, box in post_pairs)
-        distance_drop = max(0.0, initial_distance - closest_after) / diagonal
+    ]
+    settle_motion = track_motion_norm(objects, settle_indices, diagonal)
+    settled = len(settle_indices) >= 3 and settle_motion <= VISION_SETTLE_MOTION_NORM
 
-    final_relation = "unknown"
-    if object_present and box_present:
-        for i in range(n - 1, max(-1, n - max(3, n // 5) - 1), -1):
-            relation = _rect_relation(object_boxes[i], box_boxes[i])
-            if relation != "unknown":
-                final_relation = relation
-                break
+    alignment_error = float("inf")
+    event_times = [
+        value for value in (grasp_timestamp, release_timestamp) if value is not None
+    ]
+    valid_times = decoded.timestamps[np.isfinite(decoded.timestamps)]
+    if event_times and len(valid_times):
+        alignment_error = max(
+            float(np.min(np.abs(valid_times - event_time)))
+            for event_time in event_times
+        )
 
-    confidence = 0.55
-    if max(object_rate, box_rate) >= 0.8:
-        confidence += 0.15
-    if scenario in {"normal", "object_without_box", "box_without_object"}:
-        confidence += 0.15
-    if n >= 20:
-        confidence += 0.10
-    confidence = min(0.95, confidence)
-
+    confidence = 0.45
+    confidence += 0.18 * min(1.0, max(object_rate, box_rate))
+    confidence += 0.12 if scenario != "empty_or_unrecognized" else 0.0
+    confidence += 0.10 if n >= 20 else 0.0
+    confidence += 0.08 if alignment_error <= 0.05 else 0.0
+    confidence = min(0.90, confidence)
     notes = [
-        f"场景={scenario}",
+        f"胸前场景={scenario}",
         f"红色玩具检出率={object_rate:.0%}",
         f"黄色盒子检出率={box_rate:.0%}",
     ]
     if final_relation != "unknown":
-        notes.append(f"最终玩具位置={final_relation}")
+        notes.append(
+            f"释放后玩具位置={final_relation}(盒内覆盖={final_ratio:.0%})"
+        )
 
     return VisionEvidence(
         available=True,
         camera="cam_mid_chest",
+        cameras=["cam_mid_chest"],
+        chest_available=True,
         sample_count=n,
         scenario=scenario,
         object_present=object_present,
@@ -302,27 +194,215 @@ def analyze_frames(
         object_box_distance_drop_norm=distance_drop,
         moved_toward_box=distance_drop >= VISION_TOWARD_BOX_NORM,
         final_object_relation=final_relation,
+        final_inside_ratio=final_ratio,
+        object_settled_after_release=settled,
+        temporal_alignment_sec=alignment_error,
         confidence=confidence,
         notes=notes,
     )
 
 
+def analyze_wrist_frames(
+    decoded: DecodedFrames,
+    *,
+    grasp_timestamp: float | None,
+    release_timestamp: float | None,
+) -> VisionEvidence:
+    frames = decoded.frames
+    if len(frames) == 0:
+        return VisionEvidence(notes=["腕部相机未读取到视频帧"])
+
+    objects = track_observations(frames, red_mask, VISION_MIN_OBJECT_PIXELS)
+    n = len(frames)
+    diagonal = math.hypot(frames.shape[2], frames.shape[1])
+    anchor = (
+        frames.shape[2] * VISION_WRIST_GRIPPER_X_NORM,
+        frames.shape[1] * VISION_WRIST_GRIPPER_Y_NORM,
+    )
+    distances = np.array(
+        [
+            distance(item.centroid, anchor) / diagonal
+            if item is not None
+            else np.nan
+            for item in objects
+        ],
+        dtype=float,
+    )
+    has_grasp_event = grasp_timestamp is not None
+    grasp_idx = (
+        _event_index(
+            decoded.timestamps,
+            grasp_timestamp,
+            fallback_fraction=None,
+            n_frames=n,
+        )
+        if has_grasp_event
+        else n - 1
+    )
+    release_idx = (
+        _event_index(
+            decoded.timestamps,
+            release_timestamp,
+            fallback_fraction=None,
+            n_frames=n,
+        )
+        if release_timestamp is not None
+        else n - 1
+    )
+    release_idx = max(grasp_idx + 1, release_idx)
+    pre = distances[: max(1, grasp_idx + 1)]
+    valid_pre = pre[np.isfinite(pre)]
+    if len(valid_pre):
+        initial_distance = float(np.median(valid_pre[: max(1, len(valid_pre) // 4)]))
+        min_distance = float(np.min(valid_pre))
+        approach_drop = max(0.0, initial_distance - min_distance)
+    else:
+        min_distance = float("inf")
+        approach_drop = 0.0
+
+    held = distances[grasp_idx : min(n, release_idx + 1)]
+    near = np.isfinite(held) & (held <= VISION_WRIST_NEAR_GRIPPER_NORM)
+    near_rate = float(near.mean()) if len(near) else 0.0
+    object_near = bool(has_grasp_event and near.any())
+    object_retained = bool(
+        has_grasp_event
+        and len(near) >= 3
+        and near_rate >= VISION_WRIST_RETAIN_RATE
+        and near[-max(1, len(near) // 4) :].any()
+    )
+    first_half = near[: max(1, len(near) // 2)]
+    last_third = near[-max(1, len(near) // 3) :]
+    drop_detected = bool(
+        has_grasp_event
+        and len(near) >= 4
+        and first_half.any()
+        and not last_third.any()
+    )
+
+    detected_rate = sum(item is not None for item in objects) / n
+    confidence = 0.42 + 0.28 * min(1.0, detected_rate)
+    if grasp_timestamp is not None and np.isfinite(decoded.timestamps).any():
+        confidence += 0.10
+    if n >= 20:
+        confidence += 0.08
+    confidence = min(0.88, confidence)
+    notes = [
+        f"腕部玩具检出率={detected_rate:.0%}",
+        f"夹爪邻域保持率={near_rate:.0%}",
+    ]
+    if drop_detected:
+        notes.append("腕部视角检测到释放前脱离夹爪")
+
+    return VisionEvidence(
+        available=True,
+        camera="cam_left_wrist",
+        cameras=["cam_left_wrist"],
+        wrist_available=True,
+        sample_count=n,
+        object_detection_rate=detected_rate,
+        wrist_object_near_gripper=object_near,
+        wrist_object_retained=object_retained,
+        wrist_drop_detected=drop_detected,
+        wrist_approach_drop_norm=approach_drop,
+        wrist_min_object_gripper_norm=min_distance,
+        confidence=confidence,
+        notes=notes,
+    )
+
+
+def _merge_evidence(
+    chest: VisionEvidence, wrist: VisionEvidence
+) -> VisionEvidence:
+    if not chest.available and not wrist.available:
+        return VisionEvidence(notes=chest.notes + wrist.notes)
+    if chest.available:
+        merged = chest
+    else:
+        merged = VisionEvidence(
+            available=True,
+            camera=wrist.camera,
+            scenario="unknown",
+            object_present=None,
+            box_present=None,
+        )
+    if wrist.available:
+        merged.wrist_available = True
+        merged.wrist_object_near_gripper = wrist.wrist_object_near_gripper
+        merged.wrist_object_retained = wrist.wrist_object_retained
+        merged.wrist_drop_detected = wrist.wrist_drop_detected
+        merged.wrist_approach_drop_norm = wrist.wrist_approach_drop_norm
+        merged.wrist_min_object_gripper_norm = (
+            wrist.wrist_min_object_gripper_norm
+        )
+    merged.available = True
+    merged.cameras = [
+        name
+        for name, available in (
+            ("cam_mid_chest", chest.available),
+            ("cam_left_wrist", wrist.available),
+        )
+        if available
+    ]
+    merged.camera = "+".join(merged.cameras)
+    merged.sample_count = chest.sample_count + wrist.sample_count
+    merged.notes = chest.notes + wrist.notes
+    if chest.available and wrist.available:
+        merged.confidence = min(
+            0.93, 0.58 * chest.confidence + 0.42 * wrist.confidence + 0.08
+        )
+    else:
+        merged.confidence = max(chest.confidence, wrist.confidence) * 0.88
+    return merged
+
+
 def attach_vision_evidence(data_dir: Path, signals: list[TaskSignals]) -> None:
-    """为已有 TaskSignals 就地附加胸前视频证据。"""
-    video_path = data_dir / "videos" / "cam_mid_chest.mp4"
-    ranges = load_task_video_ranges(data_dir)
-    if not video_path.is_file() or not ranges:
-        return
+    """按真实时间戳为 TaskSignals 附加胸前与腕部视频证据。"""
+    videos = {
+        "cam_mid": data_dir / "videos" / "cam_mid_chest.mp4",
+        "cam_left": data_dir / "videos" / "cam_left_wrist.mp4",
+    }
+    ranges = {
+        key: load_task_video_ranges(data_dir, key) for key in videos
+    }
+    timestamp_maps = load_camera_frame_timestamps(data_dir)
 
     for task in signals:
-        frame_range = ranges.get(task.task_index)
-        if frame_range is None:
-            task.vision.notes.append("缺少任务视频帧范围")
-            continue
-        grasp_fraction = (
-            task.grasp_phase_idx / max(task.n_frames - 1, 1)
-            if task.grasp_phase_idx is not None
-            else None
+        event_times = [
+            value
+            for value in (task.grasp_timestamp, task.release_timestamp)
+            if value is not None
+        ]
+        camera_evidence: dict[str, VisionEvidence] = {}
+        for key, video_path in videos.items():
+            frame_range = ranges[key].get(task.task_index)
+            if frame_range is None or not video_path.is_file():
+                camera_evidence[key] = VisionEvidence(
+                    notes=[f"{key} 缺少视频或 task 帧范围"]
+                )
+                continue
+            timestamp_map = timestamp_maps.get(key, {})
+            selected = select_frame_indices(
+                *frame_range,
+                timestamp_by_frame=timestamp_map,
+                event_timestamps=event_times,
+            )
+            decoded = decode_selected_frames(
+                video_path,
+                selected,
+                timestamp_by_frame=timestamp_map,
+            )
+            if key == "cam_mid":
+                camera_evidence[key] = analyze_chest_frames(
+                    decoded,
+                    grasp_timestamp=task.grasp_timestamp,
+                    release_timestamp=task.release_timestamp,
+                )
+            else:
+                camera_evidence[key] = analyze_wrist_frames(
+                    decoded,
+                    grasp_timestamp=task.grasp_timestamp,
+                    release_timestamp=task.release_timestamp,
+                )
+        task.vision = _merge_evidence(
+            camera_evidence["cam_mid"], camera_evidence["cam_left"]
         )
-        frames = _decode_sampled_frames(video_path, *frame_range)
-        task.vision = analyze_frames(frames, grasp_fraction=grasp_fraction)

@@ -26,7 +26,7 @@ DIM_ROW: dict[str, int] = {
     "S5归位": 22,
 }
 
-# Trial → Excel 列字母
+# Task → Excel 列字母
 TASK_TO_COL: dict[int, str] = {1: "E", 2: "F", 3: "G", 4: "H", 5: "I", 6: "J"}
 
 # 列字母 → openpyxl 列索引
@@ -124,6 +124,24 @@ VISION_MIN_BOX_PIXELS: int = 250
 VISION_PRESENT_RATE: float = 0.35
 VISION_OBJECT_MOTION_NORM: float = 0.02
 VISION_TOWARD_BOX_NORM: float = 0.03
+VISION_EVENT_WINDOW_SEC: float = 1.0
+VISION_SETTLE_WINDOW_SEC: float = 0.6
+VISION_SETTLE_MOTION_NORM: float = 0.012
+VISION_BOX_INNER_MARGIN_FRAC: float = 0.08
+VISION_INSIDE_RATIO: float = 0.65
+VISION_WRIST_GRIPPER_X_NORM: float = 0.50
+VISION_WRIST_GRIPPER_Y_NORM: float = 0.82
+VISION_WRIST_NEAR_GRIPPER_NORM: float = 0.28
+VISION_WRIST_RETAIN_RATE: float = 0.55
+VISION_WRIST_APPROACH_DROP_NORM: float = 0.08
+
+# =========================== 数据质量阈值 ===========================
+
+# UDP age 与图像/状态时间差超过这些量级后，证据仍可使用但要降低置信度。
+GRIPPER_UDP_FRESH_SEC: float = 0.08
+IMAGE_STATE_SYNC_GOOD_SEC: float = 0.04
+# 动作响应最大关节误差的质量缩放参考，不作为动作成功/失败硬阈值。
+TRACKING_ERROR_GOOD_RAD: float = 1.0
 
 # =========================== 通用阈值 ===========================
 
@@ -145,11 +163,10 @@ RULES_TEXT: str = """
 
 S1定位 (0-4):
   0 = 所有关节变化 <1° 且 EE 位移 <1cm
-  1 = 有移动但未形成有效靠近证据，或无目标物时仍移动
-  2 = 向目标区域靠近但未准确到位
-  3 = 5-10s 内到达可抓取区域
-  4 = 5s 内快速到达可抓取区域
-  注：缺少相机厘米级标定时，S1=3/4 自动标记人工复核
+  1 = 有移动但腕部视角未确认朝目标靠近，或无目标物时仍移动
+  2 = 目标接近夹爪/发生闭合，但未形成稳定抓取
+  3 = 稳定抓取且 5-10s 内到达
+  4 = 稳定抓取且 5s 内到达
 
 S2抓取 (0-3):
   0 = 无闭合事件，或视频确认没有目标物

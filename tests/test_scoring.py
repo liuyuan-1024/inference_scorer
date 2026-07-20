@@ -1,7 +1,7 @@
 import unittest
 
 from models import TaskJudgment
-from scoring import detail_S2_grasping, detail_S5_return
+from scoring import detail_S2_grasping, detail_S4_placing, detail_S5_return
 
 
 def judgment(**overrides) -> TaskJudgment:
@@ -55,6 +55,16 @@ class ScoringTests(unittest.TestCase):
             grip_final_val=0.95,
         )
         self.assertEqual(detail_S5_return(task)["score"], 2)
+
+    def test_inside_without_settling_is_not_accurate_placement(self) -> None:
+        task = judgment(
+            has_grasp_object=True,
+            grip_release_detected=True,
+            final_object_relation="inside",
+            place_at_box=False,
+            vision_available=True,
+        )
+        self.assertEqual(detail_S4_placing(task)["score"], 1)
 
 
 if __name__ == "__main__":

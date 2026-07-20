@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from config import DEFAULT_FPS, EXCEL_FILENAME
@@ -129,7 +130,11 @@ def save_summary(
             {
                 "task_index": j.task_index,
                 "has_motion": j.has_motion,
+                "has_grasp_attempt": j.has_grasp_attempt,
+                "has_grasp_contact": j.has_grasp_contact,
                 "has_grasp_object": j.has_grasp_object,
+                "object_lifted": j.object_lifted,
+                "object_dropped": j.object_dropped,
                 "has_place_phase": j.has_place_phase,
                 "place_at_box": j.place_at_box,
                 "approach_quality": j.approach_quality,
@@ -139,6 +144,10 @@ def save_summary(
                 "box_present": j.box_present,
                 "final_object_relation": j.final_object_relation,
                 "confidence": j.confidence,
+                "vision_confidence": j.vision_confidence,
+                "sensor_confidence": j.sensor_confidence,
+                "state_feedback_timeout_rate": j.state_feedback_timeout_rate,
+                "events": asdict(j.events),
                 "evidence": j.evidence,
                 "reason": j.reason,
             }
