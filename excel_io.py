@@ -8,11 +8,11 @@ import sys
 from pathlib import Path
 
 import openpyxl
+from openpyxl.comments import Comment
 
 from config import (
     COL_INDEX,
     DIM_ROW,
-    EXCEL_FILENAME,
     EXCEL_SHEET_NAME,
     RULES_TEXT,
     TASK_TO_COL,
@@ -23,8 +23,11 @@ def fill_excel(
     excel_path: Path,
     output_path: Path,
     scores: dict[int, dict[str, int]],
+    *,
+    score_details: dict[int, dict[str, dict]] | None = None,
+    metadata: dict | None = None,
 ) -> None:
-    """将评分写入 Excel（仅填写 S1~S5 分值，不动其他单元格）。"""
+    """将评分、审计批注和运行元数据写入 Excel。"""
     wb = openpyxl.load_workbook(str(excel_path))
     ws = wb[EXCEL_SHEET_NAME]
 
@@ -40,7 +43,45 @@ def fill_excel(
             row = DIM_ROW.get(dim_name)
             if row is None:
                 continue
-            ws.cell(row, col_idx).value = score
+            cell = ws.cell(row, col_idx)
+            cell.value = score
+            detail = (score_details or {}).get(task_idx, {}).get(dim_name)
+            if detail:
+                lines = [
+                    f"置信度: {float(detail['confidence']):.0%}",
+                    f"需人工复核: {'是' if detail.get('needs_review') else '否'}",
+                ]
+                if detail.get("review_reason"):
+                    lines.append(f"复核原因: {detail['review_reason']}")
+                lines.extend(str(x) for x in detail.get("evidence", []))
+                cell.comment = Comment("\n".join(lines), "inference_scorer")
+
+    if metadata:
+        n_action_steps = metadata.get("n_action_steps")
+        if n_action_steps is not None:
+            ws["C28"] = f"N_ACTION_STEPS_OVERRIDE = {n_action_steps}"
+        num_inference_steps = metadata.get("num_inference_steps")
+        ws["C29"] = (
+            "NUM_INFERENCE_STEPS_OVERRIDE = "
+            f"{num_inference_steps if num_inference_steps is not None else 'None'}"
+        )
+        prompt = metadata.get("task_prompt")
+        if prompt:
+            ws["C30"] = f"提示词：{prompt}"
+        video_path = metadata.get("video_path")
+        model_path = metadata.get("ckpt_dir")
+        paths = []
+        if video_path:
+            paths.append(f"video路径：{video_path}")
+        if model_path:
+            paths.append(f"模型路径：{model_path}")
+        if paths:
+            ws["C31"] = "\n".join(paths)
+
+    # openpyxl 不计算公式，要求 Excel/WPS 打开时强制重算总分和进度。
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    wb.calculation.calcMode = "auto"
 
     wb.save(str(output_path))
     print(f"  已保存: {output_path}")
