@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from video_io import DecodedFrames
-from vision import analyze_chest_frames, analyze_wrist_frames
+from evidence.vision import analyze_chest_frames, analyze_wrist_frames
+from inputs.video import DecodedFrames
 
 
 class VisionEvidenceTests(unittest.TestCase):
@@ -17,9 +17,7 @@ class VisionEvidenceTests(unittest.TestCase):
         return frame
 
     @staticmethod
-    def chest_evidence(
-        frames: np.ndarray, *, grasp_fraction: float | None = None
-    ):
+    def chest_evidence(frames: np.ndarray, *, grasp_fraction: float | None = None):
         return analyze_chest_frames(
             DecodedFrames(
                 frames=frames,
@@ -40,9 +38,7 @@ class VisionEvidenceTests(unittest.TestCase):
         frames = []
         for x in np.linspace(40, 220, 12).astype(int):
             frames.append(self.frame(object_xy=(int(x), 90), with_box=True))
-        evidence = self.chest_evidence(
-            np.stack(frames), grasp_fraction=0.2
-        )
+        evidence = self.chest_evidence(np.stack(frames), grasp_fraction=0.2)
         self.assertEqual(evidence.scenario, "normal")
         self.assertTrue(evidence.moved_toward_box)
         self.assertEqual(evidence.final_object_relation, "inside")
@@ -65,12 +61,8 @@ class VisionEvidenceTests(unittest.TestCase):
         self.assertFalse(evidence.wrist_drop_detected)
 
     def test_wrist_detects_object_leaving_before_release(self) -> None:
-        frames = [
-            self.frame(object_xy=(151, 138), with_box=False) for _ in range(4)
-        ]
-        frames.extend(
-            self.frame(object_xy=(10, 20), with_box=False) for _ in range(4)
-        )
+        frames = [self.frame(object_xy=(151, 138), with_box=False) for _ in range(4)]
+        frames.extend(self.frame(object_xy=(10, 20), with_box=False) for _ in range(4))
         evidence = analyze_wrist_frames(
             DecodedFrames(
                 frames=np.stack(frames),
@@ -81,6 +73,21 @@ class VisionEvidenceTests(unittest.TestCase):
             release_timestamp=7.0,
         )
         self.assertTrue(evidence.wrist_drop_detected)
+
+    def test_wrist_missing_detections_are_not_a_drop(self) -> None:
+        frames = [self.frame(object_xy=(151, 138), with_box=False) for _ in range(4)]
+        frames.extend(self.frame(object_xy=None, with_box=False) for _ in range(4))
+        evidence = analyze_wrist_frames(
+            DecodedFrames(
+                frames=np.stack(frames),
+                timestamps=np.arange(8, dtype=float),
+                frame_indices=np.arange(8),
+            ),
+            grasp_timestamp=1.0,
+            release_timestamp=7.0,
+        )
+        self.assertTrue(evidence.wrist_object_near_gripper)
+        self.assertFalse(evidence.wrist_drop_detected)
 
 
 if __name__ == "__main__":

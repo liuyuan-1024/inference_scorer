@@ -7,20 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
-from config import (
-    PLACE_ROI_XY_M,
-    PLACE_ROI_Z_M,
-    RETURN_MIN_EXCURSION_M,
-    RETURN_MIN_PROGRESS_M,
-    RETRACT_DIST_M,
-    RETRACT_Z_RISE_M,
-    WITHDRAW_HOME_XY_M,
-    WITHDRAW_HOME_Z_M,
-)
-from events import build_action_event_chain, fused_confidence
-import grasp_analysis
-from models import TaskJudgment, TaskSignals
-import motion_analysis
+from domain.models import TaskEvidence
+from domain.rules_v5 import V5_RULES
+from evidence import grasp, motion
+from evidence.events import build_action_event_chain
+from inputs.segments import TaskSegmentResolver, resolve_task_segments
 
 __all__ = [
     "analyze_data_dir",
@@ -34,13 +25,13 @@ __all__ = [
 
 
 def judge_task(
-    t: TaskSignals, *, place_center: np.ndarray, jc_baseline: float | None = None
-) -> TaskJudgment:
+    t: TaskEvidence, *, place_center: np.ndarray, jc_baseline: float | None = None
+) -> TaskEvidence:
     """对单个 task 做综合语义判定（不依赖首帧视频）。"""
-    motion_analysis.analyze_motion_phases(t, place_center=place_center)
+    motion.analyze_motion_phases(t, place_center=place_center)
 
-    has_motion = motion_analysis.detect_motion(t)
-    has_grasp_attempt = grasp_analysis.detect_grasp_attempt(t, has_motion)
+    has_motion = motion.detect_motion(t)
+    has_grasp_attempt = grasp.detect_grasp_attempt(t, has_motion)
 
     # OOD“有盒无物”中的闭合动作不能算作抓取。
     if t.vision.available and t.vision.object_present is False:
@@ -64,8 +55,9 @@ def judge_task(
         has_place_phase = bool(
             t.grip_release_detected
             and (
-                t.grasp_transport_m >= 0.03
-                or t.retract_dist_m >= RETRACT_DIST_M * 0.5
+                t.grasp_transport_m >= V5_RULES.place_fallback_transport_m
+                or t.retract_dist_m
+                >= V5_RULES.retract_dist_m * V5_RULES.place_fallback_retract_ratio
                 or t.transport_to_place
             )
         )
@@ -74,7 +66,13 @@ def judge_task(
             place_at_box = bool(
                 np.all(
                     np.abs(ee - place_center)
-                    <= np.array([PLACE_ROI_XY_M, PLACE_ROI_XY_M, PLACE_ROI_Z_M])
+                    <= np.array(
+                        [
+                            V5_RULES.place_roi_xy_m,
+                            V5_RULES.place_roi_xy_m,
+                            V5_RULES.place_roi_z_m,
+                        ]
+                    )
                 )
             )
 
@@ -82,17 +80,18 @@ def judge_task(
     action_complete = has_motion and has_grasp_object and has_place_phase
 
     # --- 靠近质量 ---
-    _, approach_quality = motion_analysis.classify_approach(t, has_motion)
+    _, approach_quality = motion.classify_approach(t, has_motion)
 
     # --- 撤回分类 ---
     has_retract = (
-        t.retract_dist_m >= RETRACT_DIST_M or t.retract_z_rise_m >= RETRACT_Z_RISE_M
+        t.retract_dist_m >= V5_RULES.retract_dist_m
+        or t.retract_z_rise_m >= V5_RULES.retract_z_rise_m
     )
     has_withdraw = (
-        t.max_home_excursion_m >= RETURN_MIN_EXCURSION_M
-        and t.return_progress_m >= RETURN_MIN_PROGRESS_M
-        and t.home_xy_error_m <= WITHDRAW_HOME_XY_M
-        and t.home_z_error_m <= WITHDRAW_HOME_Z_M
+        t.max_home_excursion_m >= V5_RULES.return_min_excursion_m
+        and t.return_progress_m >= V5_RULES.return_min_progress_m
+        and t.home_xy_error_m <= V5_RULES.withdraw_home_xy_m
+        and t.home_z_error_m <= V5_RULES.withdraw_home_z_m
     )
 
     if has_grasp_contact and has_place_phase and (place_at_box or t.transport_to_place):
@@ -123,12 +122,12 @@ def judge_task(
         parts.append(f"归位({t.withdraw_home_dist_m:.3f}m)")
 
     evidence = list(t.vision.notes)
-    if t.grip_empty_close:
-        evidence.append(f"夹爪闭合至{t.grip_closed_min:.3f}，判为空夹")
-    if t.grasp_phase_idx is not None:
+    if t.grip_fully_closed:
         evidence.append(
-            f"抓取候选帧={t.grasp_phase_idx}({t.grasp_detected_by or '?'})"
+            f"夹爪闭合至{t.grip_closed_min:.3f}，为空夹候选，需结合接触与视觉"
         )
+    if t.grasp_phase_idx is not None:
+        evidence.append(f"抓取候选帧={t.grasp_phase_idx}({t.grasp_detected_by or '?'})")
     evidence.append(
         f"接触残差: ΔJC={t.jc_contact_delta:.0f}, ΔFz={t.fz_contact_delta:.2f}N"
     )
@@ -139,67 +138,21 @@ def judge_task(
         f"反馈超时率={t.state_feedback_timeout_rate:.0%}"
     )
     reason = "；".join(parts) if parts else "信号不足"
-    confidence, vision_confidence, sensor_confidence = fused_confidence(t, events)
-    if t.grip_empty_close or (t.vision.available and t.vision.object_present is False):
-        confidence = max(confidence, min(vision_confidence, 0.88))
-
-    return TaskJudgment(
-        task_index=t.task_index,
-        has_motion=has_motion,
-        has_grasp_attempt=has_grasp_attempt,
-        has_grasp_contact=has_grasp_contact,
-        has_grasp_object=has_grasp_object,
-        has_place_phase=has_place_phase,
-        place_at_box=place_at_box,
-        action_complete=action_complete,
-        approach_quality=approach_quality,
-        retract_semantic=retract_semantic,
-        has_retract=has_retract,
-        has_withdraw_home=has_withdraw,
-        n_frames=t.n_frames,
-        reason=reason,
-        grip_release_detected=t.grip_release_detected,
-        grasp_time_sec=t.grasp_time_sec,
-        ee_path_m=t.ee_path_m,
-        joint_delta_rad=t.joint_delta_rad,
-        task_start_ee=t.task_start_ee,
-        task_start_frame_index=t.task_start_frame_index,
-        task_start_timestamp=t.task_start_timestamp,
-        approach_z_drop_m=t.approach_z_drop_m,
-        approach_xy_m=t.approach_xy_m,
-        approach_align=t.approach_align,
-        path_efficiency=t.path_efficiency,
-        approach_frame_frac=t.approach_frame_frac,
-        jc_at_grasp=t.jc_at_grasp,
-        jc_grasp_rise=t.jc_grasp_rise,
-        fz_spike_grasp=t.fz_spike_grasp,
-        grasp_transport_m=t.grasp_transport_m,
-        retract_dist_m=t.retract_dist_m,
-        retract_z_rise_m=t.retract_z_rise_m,
-        withdraw_home_dist_m=t.withdraw_home_dist_m,
-        transport_to_place=t.transport_to_place,
-        home_xy_error_m=t.home_xy_error_m,
-        home_z_error_m=t.home_z_error_m,
-        max_home_excursion_m=t.max_home_excursion_m,
-        return_progress_m=t.return_progress_m,
-        return_duration_sec=t.return_duration_sec,
-        grip_final_val=t.grip_final_val,
-        grip_empty_close=t.grip_empty_close,
-        object_lifted=events.object_lifted,
-        object_dropped=events.object_dropped,
-        vision_available=t.vision.available,
-        scenario=t.vision.scenario,
-        object_present=t.vision.object_present,
-        box_present=t.vision.box_present,
-        object_motion_norm=t.vision.object_motion_after_grasp_norm,
-        final_object_relation=t.vision.final_object_relation,
-        confidence=confidence,
-        vision_confidence=vision_confidence,
-        sensor_confidence=sensor_confidence,
-        state_feedback_timeout_rate=t.state_feedback_timeout_rate,
-        events=events,
-        evidence=evidence,
-    )
+    t.has_motion = has_motion
+    t.has_grasp_attempt = has_grasp_attempt
+    t.has_grasp_contact = has_grasp_contact
+    t.has_grasp_object = has_grasp_object
+    t.has_place_phase = has_place_phase
+    t.place_at_box = place_at_box
+    t.action_complete = action_complete
+    t.approach_quality = approach_quality
+    t.retract_semantic = retract_semantic
+    t.has_retract = has_retract
+    t.has_withdraw_home = has_withdraw
+    t.reason = reason
+    t.events = events
+    t.evidence = evidence
+    return t
 
 
 # ===================================================================
@@ -207,37 +160,31 @@ def judge_task(
 # ===================================================================
 
 
-def learn_place_center(signals: list[TaskSignals]) -> np.ndarray:
+def learn_place_center(signals: list[TaskEvidence]) -> np.ndarray:
     """
     从各 task 的抓取后末端位置学习放置中心。
 
     取有负载运输的 task 的终点位置的中位数。
     """
-    from config import GRASP_TRANSPORT_M
-
     place_ee = []
     for t in signals:
         ee = t.ee_at_place
         if not ee:
             continue
-        if t.grasp_transport_m >= GRASP_TRANSPORT_M * 0.5:
+        if t.grasp_transport_m >= V5_RULES.grasp_transport_m * 0.5:
             place_ee.append(ee)
 
     if place_ee:
         arr = np.array(place_ee)
         return np.median(arr, axis=0)
 
-    from config import DEFAULT_PLACE_CENTER
-
-    return np.array(DEFAULT_PLACE_CENTER)
+    return np.array(V5_RULES.default_place_center)
 
 
 def learn_place_tolerance(
-    signals: list[TaskSignals], place_center: np.ndarray
+    signals: list[TaskEvidence], place_center: np.ndarray
 ) -> np.ndarray:
     """学习放置容差。"""
-    from config import PLACE_ROI_XY_M, PLACE_ROI_Z_M
-
     diffs = []
     for t in signals:
         ee = t.ee_at_place
@@ -248,12 +195,17 @@ def learn_place_tolerance(
     if diffs:
         arr = np.array(diffs)
         spread = np.std(arr, axis=0)
-        return np.maximum(spread * 2.5, [PLACE_ROI_XY_M, PLACE_ROI_XY_M, PLACE_ROI_Z_M])
+        return np.maximum(
+            spread * 2.5,
+            [V5_RULES.place_roi_xy_m, V5_RULES.place_roi_xy_m, V5_RULES.place_roi_z_m],
+        )
 
-    return np.array([PLACE_ROI_XY_M, PLACE_ROI_XY_M, PLACE_ROI_Z_M])
+    return np.array(
+        [V5_RULES.place_roi_xy_m, V5_RULES.place_roi_xy_m, V5_RULES.place_roi_z_m]
+    )
 
 
-def learn_jc_baseline(signals: list[TaskSignals]) -> float:
+def learn_jc_baseline(signals: list[TaskEvidence]) -> float:
     """
     学习 JC 基线值。
 
@@ -286,14 +238,20 @@ def learn_jc_baseline(signals: list[TaskSignals]) -> float:
 # ===================================================================
 
 
-def analyze_data_dir(data_dir: Path) -> list[TaskJudgment]:
+def analyze_data_dir(
+    data_dir: Path, *, segment_resolver: TaskSegmentResolver | None = None
+) -> list[TaskEvidence]:
     """完整分析一个 eval 目录。"""
-    from loader import load_frame_to_segment, ingest_eval_log
+    from inputs.eval_log import ingest_eval_log
 
     data_dir = data_dir.resolve()
-    frame_seg = load_frame_to_segment(data_dir)
+    segment_assignments = resolve_task_segments(data_dir, segment_resolver)
+    frame_seg = segment_assignments.state_frame_to_segment
     if not frame_seg:
-        print(f"无法读取 frame→segment 映射（{data_dir}）", file=sys.stderr)
+        print(
+            f"分段识别器未返回 state frame→task segment 映射（{data_dir}）",
+            file=sys.stderr,
+        )
         return []
 
     signals = ingest_eval_log(data_dir, frame_seg)
@@ -305,22 +263,26 @@ def analyze_data_dir(data_dir: Path) -> list[TaskJudgment]:
 
     # --- 抓取事件检测（填充 grasp_phase_idx） ---
     for t in raw_signals:
-        gp, method = grasp_analysis.detect_grasp_event(t)
+        gp, method = grasp.detect_grasp_event(t)
         t.grasp_phase_idx = gp
         t.grasp_detected_by = method
         if gp is not None:
-            grasp_analysis.analyze_grasp_signals(t)
+            grasp.analyze_grasp_signals(t)
 
     # --- 附加视频语义证据 ---
-    from vision import attach_vision_evidence
+    from evidence.vision import attach_vision_evidence
 
-    attach_vision_evidence(data_dir, raw_signals)
+    attach_vision_evidence(
+        data_dir,
+        raw_signals,
+        segment_assignments=segment_assignments,
+    )
 
     # 不再从失败任务终点反向“学习”盒子位置，避免循环污染。
-    from config import DEFAULT_PLACE_CENTER
-
-    place_center = np.array(DEFAULT_PLACE_CENTER)
-    place_tol = np.array([PLACE_ROI_XY_M, PLACE_ROI_XY_M, PLACE_ROI_Z_M])
+    place_center = np.array(V5_RULES.default_place_center)
+    place_tol = np.array(
+        [V5_RULES.place_roi_xy_m, V5_RULES.place_roi_xy_m, V5_RULES.place_roi_z_m]
+    )
 
     print(
         f"  place_center=({place_center[0]:.4f}, {place_center[1]:.4f}, {place_center[2]:.4f})"

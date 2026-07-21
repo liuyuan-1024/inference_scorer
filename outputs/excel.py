@@ -10,21 +10,20 @@ from pathlib import Path
 import openpyxl
 from openpyxl.comments import Comment
 
-from config import (
-    COL_INDEX,
+from outputs.config import (
     DIM_ROW,
     EXCEL_SHEET_NAME,
-    RULES_TEXT,
-    TASK_TO_COL,
+    TASK_TO_COLUMN,
 )
+from domain.models import TaskScore
+from domain.rules_v5 import RULES_TEXT
 
 
 def fill_excel(
     excel_path: Path,
     output_path: Path,
-    scores: dict[int, dict[str, int]],
+    tasks: dict[int, TaskScore],
     *,
-    score_details: dict[int, dict[str, dict]] | None = None,
     metadata: dict | None = None,
 ) -> None:
     """将评分、审计批注和运行元数据写入 Excel。"""
@@ -32,29 +31,29 @@ def fill_excel(
     ws = wb[EXCEL_SHEET_NAME]
 
     # 写入评分
-    for task_idx, dim_scores in sorted(scores.items()):
-        col_letter = TASK_TO_COL.get(task_idx)
-        if col_letter is None:
+    for task_idx, task_score in sorted(tasks.items()):
+        col_idx = TASK_TO_COLUMN.get(task_idx)
+        if col_idx is None:
             print(f"  ⚠ 跳过 task {task_idx}：无对应 Excel 列", file=sys.stderr)
             continue
-        col_idx = COL_INDEX[col_letter]
 
-        for dim_name, score in dim_scores.items():
+        for dim_name, result in task_score.stages.items():
             row = DIM_ROW.get(dim_name)
             if row is None:
                 continue
             cell = ws.cell(row, col_idx)
-            cell.value = score
-            detail = (score_details or {}).get(task_idx, {}).get(dim_name)
-            if detail:
-                lines = [
-                    f"置信度: {float(detail['confidence']):.0%}",
-                    f"需人工复核: {'是' if detail.get('needs_review') else '否'}",
-                ]
-                if detail.get("review_reason"):
-                    lines.append(f"复核原因: {detail['review_reason']}")
-                lines.extend(str(x) for x in detail.get("evidence", []))
-                cell.comment = Comment("\n".join(lines), "inference_scorer")
+            cell.value = result.score
+            lines = [
+                f"规则版本: {result.rule_version}",
+                f"置信度: {result.confidence:.0%}",
+                f"需人工复核: {'是' if result.needs_review else '否'}",
+            ]
+            if result.review_reason:
+                lines.append(f"复核原因: {result.review_reason}")
+            if result.missing_evidence:
+                lines.append("缺失证据: " + "、".join(result.missing_evidence))
+            lines.extend(result.evidence)
+            cell.comment = Comment("\n".join(lines), "inference_scorer")
 
     if metadata:
         n_action_steps = metadata.get("n_action_steps")

@@ -9,12 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
-from config import (
-    GRIPPER_UDP_FRESH_SEC,
-    IMAGE_STATE_SYNC_GOOD_SEC,
-    TRACKING_ERROR_GOOD_RAD,
-)
-from models import TaskSignals
+from domain.models import TaskEvidence
+from domain.rules_v5 import V5_RULES
 
 
 def _as_float(value, default: float = float("nan")) -> float:
@@ -30,34 +26,10 @@ def load_frame_to_segment(data_dir: Path) -> dict[int, int]:
 
     备用方案：从 trajectory.parquet 读取。
     """
-    mapping: dict[int, int] = {}
-    mf = data_dir / "machine_flow.jsonl"
-    if mf.is_file():
-        with mf.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                o = json.loads(line)
-                if o.get("event") == "chunk_inference" and "frame_index" in o:
-                    seg = o.get("task_segment_index")
-                    if seg is not None:
-                        mapping[int(o["frame_index"])] = int(seg)
+    # 保留旧 API 供外部调用；分段解析的唯一实现在 inputs.segments。
+    from inputs.segments import RecordedTaskSegmentResolver
 
-    if mapping:
-        return mapping
-
-    # 备用：从 trajectory.parquet 读取
-    pq = data_dir / "trajectory_data" / "trajectory.parquet"
-    if pq.is_file():
-        import pandas as pd
-
-        df = pd.read_parquet(
-            pq, columns=["inference_frame_index", "task_segment_index"]
-        )
-        for fi, seg in zip(df["inference_frame_index"], df["task_segment_index"]):
-            mapping[int(fi)] = int(seg)
-    return mapping
+    return RecordedTaskSegmentResolver().resolve(data_dir).state_frame_to_segment
 
 
 def load_eval_log(data_dir: Path) -> list[dict]:
@@ -83,7 +55,7 @@ def load_eval_log(data_dir: Path) -> list[dict]:
 
 def ingest_eval_log(
     data_dir: Path, frame_seg: dict[int, int]
-) -> dict[int, TaskSignals]:
+) -> dict[int, TaskEvidence]:
     """解析 eval_log.jsonl，按 task 聚合信号。"""
     records = load_eval_log(data_dir)
     if not records:
@@ -100,9 +72,7 @@ def ingest_eval_log(
         ee_pose = rs.get("end_effector_pose") or {}
         ee = (ee_pose.get("left_arm") or [0, 0, 0])[:3]
         grip_state = rs.get("gripper_state") or {}
-        grip_udp = o.get("gripper_udp_feedback") or rs.get(
-            "gripper_udp_feedback"
-        ) or {}
+        grip_udp = o.get("gripper_udp_feedback") or rs.get("gripper_udp_feedback") or {}
         grip = grip_udp.get("left", grip_state.get("left_gripper"))
         wrench = (rs.get("end_effector_wrench_6d") or {}).get("left_arm") or [0] * 6
         fz = float(wrench[2]) if len(wrench) > 2 else 0.0
@@ -165,7 +135,7 @@ def ingest_eval_log(
         d["desired_grip"].append(desired_grip)
         d["feedback"].extend(feedback_rows)
 
-    out: dict[int, TaskSignals] = {}
+    out: dict[int, TaskEvidence] = {}
     for seg, d in by_seg.items():
         # 日志不保证物理行序严格递增；task 原点必须取该 segment
         # 帧号最小的状态，而不是文件中偶然最先出现的状态。
@@ -210,7 +180,7 @@ def ingest_eval_log(
             else np.empty((0, 7))
         )
 
-        t = TaskSignals(task_index=seg, n_frames=len(ee))
+        t = TaskEvidence(task_index=seg, n_frames=len(ee))
         t.ee_traj = ee
         t.fz_traj = fz
         t.jc_traj = jc
@@ -236,9 +206,7 @@ def ingest_eval_log(
                 t.task_start_timestamp = float(frame_times[0])
         if len(ee) >= 2:
             t.ee_path_m = float(np.linalg.norm(np.diff(ee, axis=0), axis=1).sum())
-            t.max_ee_excursion_m = float(
-                np.linalg.norm(ee - ee[0], axis=1).max()
-            )
+            t.max_ee_excursion_m = float(np.linalg.norm(ee - ee[0], axis=1).max())
         if len(jp) >= 2:
             t.joint_delta_rad = float(np.abs(np.diff(jp, axis=0)).sum())
             t.max_joint_excursion_rad = float(np.abs(jp - jp[0]).max())
@@ -280,18 +248,21 @@ def ingest_eval_log(
 
         udp_rate = float(grip_received.mean()) if len(grip_received) else 0.0
         udp_freshness = (
-            max(0.0, 1.0 - t.gripper_udp_age_p95_sec / GRIPPER_UDP_FRESH_SEC)
+            max(0.0, 1.0 - t.gripper_udp_age_p95_sec / V5_RULES.gripper_udp_fresh_sec)
             if np.isfinite(t.gripper_udp_age_p95_sec)
             else 0.0
         )
         sync_quality = (
-            max(0.0, 1.0 - t.image_state_diff_p95_sec / IMAGE_STATE_SYNC_GOOD_SEC)
+            max(
+                0.0,
+                1.0 - t.image_state_diff_p95_sec / V5_RULES.image_state_sync_good_sec,
+            )
             if np.isfinite(t.image_state_diff_p95_sec)
             else 0.0
         )
         feedback_quality = 1.0 - min(1.0, t.state_feedback_timeout_rate)
         tracking_quality = max(
-            0.0, 1.0 - t.response_tracking_error_p95 / TRACKING_ERROR_GOOD_RAD
+            0.0, 1.0 - t.response_tracking_error_p95 / V5_RULES.tracking_error_good_rad
         )
         t.sensor_confidence = float(
             np.clip(
@@ -332,7 +303,7 @@ def load_frame_timestamps(data_dir: Path) -> list[dict]:
     return records
 
 
-def get_fps(data_dir: Path, default: float = 15.0) -> float:
+def get_fps(data_dir: Path, default: float = V5_RULES.default_fps) -> float:
     """从 meta.json 获取帧率。"""
     meta = load_meta(data_dir)
     return float(meta.get("fps", default))

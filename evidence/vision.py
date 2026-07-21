@@ -7,27 +7,16 @@ from pathlib import Path
 
 import numpy as np
 
-from config import (
-    VISION_MIN_BOX_PIXELS,
-    VISION_MIN_OBJECT_PIXELS,
-    VISION_PRESENT_RATE,
-    VISION_SETTLE_WINDOW_SEC,
-    VISION_SETTLE_MOTION_NORM,
-    VISION_TOWARD_BOX_NORM,
-    VISION_WRIST_GRIPPER_X_NORM,
-    VISION_WRIST_GRIPPER_Y_NORM,
-    VISION_WRIST_NEAR_GRIPPER_NORM,
-    VISION_WRIST_RETAIN_RATE,
-)
-from models import TaskSignals, VisionEvidence
-from video_io import (
+from domain.models import TaskEvidence, VisionEvidence
+from domain.rules_v5 import V5_RULES
+from inputs.video import (
     DecodedFrames,
     decode_selected_frames,
     load_camera_frame_timestamps,
-    load_task_video_ranges,
     select_frame_indices,
 )
-from vision_cv import (
+from inputs.segments import TaskSegmentAssignments, resolve_task_segments
+from evidence.vision_cv import (
     box_relation,
     distance,
     red_mask,
@@ -73,14 +62,14 @@ def analyze_chest_frames(
     if len(frames) == 0:
         return VisionEvidence(notes=["胸前相机未读取到视频帧"])
 
-    objects = track_observations(frames, red_mask, VISION_MIN_OBJECT_PIXELS)
-    boxes = track_observations(frames, yellow_mask, VISION_MIN_BOX_PIXELS)
+    objects = track_observations(frames, red_mask, V5_RULES.vision_min_object_pixels)
+    boxes = track_observations(frames, yellow_mask, V5_RULES.vision_min_box_pixels)
     n = len(frames)
     early_n = max(1, min(n, max(3, n // 4)))
     object_rate = sum(item is not None for item in objects[:early_n]) / early_n
     box_rate = sum(item is not None for item in boxes[:early_n]) / early_n
-    object_present = object_rate >= VISION_PRESENT_RATE
-    box_present = box_rate >= VISION_PRESENT_RATE
+    object_present = object_rate >= V5_RULES.vision_present_rate
+    box_present = box_rate >= V5_RULES.vision_present_rate
     if object_present and box_present:
         scenario = "normal"
     elif object_present:
@@ -120,11 +109,14 @@ def analyze_chest_frames(
         if objects[i] is not None and boxes[i] is not None
     ]
     if initial_distances and post_distances:
-        distance_drop = max(
-            0.0, float(np.median(initial_distances)) - min(post_distances)
-        ) / diagonal
+        distance_drop = (
+            max(0.0, float(np.median(initial_distances)) - min(post_distances))
+            / diagonal
+        )
 
-    final_start = release_idx if release_timestamp is not None else max(0, n - max(3, n // 5))
+    final_start = (
+        release_idx if release_timestamp is not None else max(0, n - max(3, n // 5))
+    )
     final_candidates: list[tuple[str, float, int]] = []
     for i in range(final_start, n):
         relation, ratio = box_relation(objects[i], boxes[i])
@@ -143,13 +135,19 @@ def analyze_chest_frames(
             release_timestamp is None
             or not np.isfinite(decoded.timestamps[i])
             or (
-                release_timestamp + 0.15 <= decoded.timestamps[i]
-                <= release_timestamp + 0.15 + VISION_SETTLE_WINDOW_SEC
+                release_timestamp + V5_RULES.vision_settle_release_delay_sec
+                <= decoded.timestamps[i]
+                <= release_timestamp
+                + V5_RULES.vision_settle_release_delay_sec
+                + V5_RULES.vision_settle_window_sec
             )
         )
     ]
     settle_motion = track_motion_norm(objects, settle_indices, diagonal)
-    settled = len(settle_indices) >= 3 and settle_motion <= VISION_SETTLE_MOTION_NORM
+    settled = (
+        len(settle_indices) >= V5_RULES.vision_settle_min_frames
+        and settle_motion <= V5_RULES.vision_settle_motion_norm
+    )
 
     alignment_error = float("inf")
     event_times = [
@@ -174,9 +172,7 @@ def analyze_chest_frames(
         f"黄色盒子检出率={box_rate:.0%}",
     ]
     if final_relation != "unknown":
-        notes.append(
-            f"释放后玩具位置={final_relation}(盒内覆盖={final_ratio:.0%})"
-        )
+        notes.append(f"释放后玩具位置={final_relation}(盒内覆盖={final_ratio:.0%})")
 
     return VisionEvidence(
         available=True,
@@ -192,7 +188,7 @@ def analyze_chest_frames(
         object_motion_norm=object_motion,
         object_motion_after_grasp_norm=motion_after_grasp,
         object_box_distance_drop_norm=distance_drop,
-        moved_toward_box=distance_drop >= VISION_TOWARD_BOX_NORM,
+        moved_toward_box=distance_drop >= V5_RULES.vision_toward_box_norm,
         final_object_relation=final_relation,
         final_inside_ratio=final_ratio,
         object_settled_after_release=settled,
@@ -212,18 +208,16 @@ def analyze_wrist_frames(
     if len(frames) == 0:
         return VisionEvidence(notes=["腕部相机未读取到视频帧"])
 
-    objects = track_observations(frames, red_mask, VISION_MIN_OBJECT_PIXELS)
+    objects = track_observations(frames, red_mask, V5_RULES.vision_min_object_pixels)
     n = len(frames)
     diagonal = math.hypot(frames.shape[2], frames.shape[1])
     anchor = (
-        frames.shape[2] * VISION_WRIST_GRIPPER_X_NORM,
-        frames.shape[1] * VISION_WRIST_GRIPPER_Y_NORM,
+        frames.shape[2] * V5_RULES.vision_wrist_gripper_x_norm,
+        frames.shape[1] * V5_RULES.vision_wrist_gripper_y_norm,
     )
     distances = np.array(
         [
-            distance(item.centroid, anchor) / diagonal
-            if item is not None
-            else np.nan
+            distance(item.centroid, anchor) / diagonal if item is not None else np.nan
             for item in objects
         ],
         dtype=float,
@@ -249,7 +243,7 @@ def analyze_wrist_frames(
         if release_timestamp is not None
         else n - 1
     )
-    release_idx = max(grasp_idx + 1, release_idx)
+    release_idx = min(n, max(grasp_idx + 1, release_idx))
     pre = distances[: max(1, grasp_idx + 1)]
     valid_pre = pre[np.isfinite(pre)]
     if len(valid_pre):
@@ -260,23 +254,92 @@ def analyze_wrist_frames(
         min_distance = float("inf")
         approach_drop = 0.0
 
-    held = distances[grasp_idx : min(n, release_idx + 1)]
-    near = np.isfinite(held) & (held <= VISION_WRIST_NEAR_GRIPPER_NORM)
-    near_rate = float(near.mean()) if len(near) else 0.0
-    object_near = bool(has_grasp_event and near.any())
-    object_retained = bool(
+    # 释放帧及其紧邻窗口不参与掉落判定，避免把正常张开误判为提前掉落。
+    hold_end = release_idx if release_timestamp is not None else n
+    held = distances[grasp_idx:hold_end]
+    held_times = decoded.timestamps[grasp_idx:hold_end]
+    observed = np.isfinite(held)
+    near = observed & (held <= V5_RULES.vision_wrist_near_gripper_norm)
+    observation_rate = float(observed.mean()) if len(observed) else 0.0
+    near_rate = float(near.sum() / observed.sum()) if observed.any() else 0.0
+
+    if (
         has_grasp_event
-        and len(near) >= 3
-        and near_rate >= VISION_WRIST_RETAIN_RATE
-        and near[-max(1, len(near) // 4) :].any()
+        and grasp_timestamp is not None
+        and np.isfinite(held_times).any()
+    ):
+        acquire_window = (
+            np.isfinite(held_times)
+            & (held_times >= grasp_timestamp)
+            & (held_times <= grasp_timestamp + V5_RULES.vision_wrist_acquire_window_sec)
+        )
+    elif has_grasp_event:
+        acquire_window = np.zeros(len(held), dtype=bool)
+        acquire_window[: min(5, len(held))] = True
+    else:
+        acquire_window = np.zeros(len(held), dtype=bool)
+    acquire_observed = observed & acquire_window
+    acquire_rate = (
+        float((near & acquire_window).sum() / acquire_observed.sum())
+        if acquire_observed.any()
+        else 0.0
     )
-    first_half = near[: max(1, len(near) // 2)]
-    last_third = near[-max(1, len(near) // 3) :]
-    drop_detected = bool(
+    object_near = bool(
         has_grasp_event
-        and len(near) >= 4
-        and first_half.any()
-        and not last_third.any()
+        and acquire_observed.sum() >= 2
+        and acquire_rate >= V5_RULES.vision_wrist_acquire_rate
+    )
+
+    early_window = acquire_window
+    early_observed = observed & early_window
+    early_hold_rate = (
+        float((near & early_window).sum() / early_observed.sum())
+        if early_observed.any()
+        else 0.0
+    )
+    late_count = max(3, len(held) // 3)
+    late_window = np.zeros(len(held), dtype=bool)
+    late_window[-min(late_count, len(held)) :] = True
+    late_observed = observed & late_window
+    late_hold_rate = (
+        float((near & late_window).sum() / late_observed.sum())
+        if late_observed.any()
+        else 0.0
+    )
+    object_retained = bool(
+        object_near
+        and observed.sum() >= 3
+        and near_rate >= V5_RULES.vision_wrist_retain_rate
+        and late_hold_rate >= V5_RULES.vision_wrist_retain_rate
+    )
+
+    drop_window = observed.copy()
+    if (
+        release_timestamp is not None
+        and len(held_times)
+        and np.isfinite(held_times).any()
+    ):
+        drop_window &= ~np.isfinite(held_times) | (
+            held_times <= release_timestamp - V5_RULES.vision_wrist_release_guard_sec
+        )
+    far = drop_window & ~near
+    near_indices = np.flatnonzero(near & acquire_window)
+    far_run = 0
+    if len(near_indices) >= 2:
+        current_run = 0
+        for is_far in far[near_indices[1] + 1 :]:
+            current_run = current_run + 1 if is_far else 0
+            far_run = max(far_run, current_run)
+    late_drop_observed = drop_window & late_window
+    late_far_rate = (
+        float((far & late_window).sum() / late_drop_observed.sum())
+        if late_drop_observed.any()
+        else 0.0
+    )
+    drop_detected = bool(
+        object_near
+        and far_run >= V5_RULES.vision_wrist_drop_far_min_frames
+        and late_far_rate >= V5_RULES.vision_wrist_drop_far_rate
     )
 
     detected_rate = sum(item is not None for item in objects) / n
@@ -288,7 +351,8 @@ def analyze_wrist_frames(
     confidence = min(0.88, confidence)
     notes = [
         f"腕部玩具检出率={detected_rate:.0%}",
-        f"夹爪邻域保持率={near_rate:.0%}",
+        f"夹爪获取率={acquire_rate:.0%}",
+        f"夹持前段/后段保持率={early_hold_rate:.0%}/{late_hold_rate:.0%}",
     ]
     if drop_detected:
         notes.append("腕部视角检测到释放前脱离夹爪")
@@ -303,6 +367,10 @@ def analyze_wrist_frames(
         wrist_object_near_gripper=object_near,
         wrist_object_retained=object_retained,
         wrist_drop_detected=drop_detected,
+        wrist_observation_rate=observation_rate,
+        wrist_acquire_rate=acquire_rate,
+        wrist_early_hold_rate=early_hold_rate,
+        wrist_late_hold_rate=late_hold_rate,
         wrist_approach_drop_norm=approach_drop,
         wrist_min_object_gripper_norm=min_distance,
         confidence=confidence,
@@ -310,9 +378,7 @@ def analyze_wrist_frames(
     )
 
 
-def _merge_evidence(
-    chest: VisionEvidence, wrist: VisionEvidence
-) -> VisionEvidence:
+def _merge_evidence(chest: VisionEvidence, wrist: VisionEvidence) -> VisionEvidence:
     if not chest.available and not wrist.available:
         return VisionEvidence(notes=chest.notes + wrist.notes)
     if chest.available:
@@ -330,10 +396,12 @@ def _merge_evidence(
         merged.wrist_object_near_gripper = wrist.wrist_object_near_gripper
         merged.wrist_object_retained = wrist.wrist_object_retained
         merged.wrist_drop_detected = wrist.wrist_drop_detected
+        merged.wrist_observation_rate = wrist.wrist_observation_rate
+        merged.wrist_acquire_rate = wrist.wrist_acquire_rate
+        merged.wrist_early_hold_rate = wrist.wrist_early_hold_rate
+        merged.wrist_late_hold_rate = wrist.wrist_late_hold_rate
         merged.wrist_approach_drop_norm = wrist.wrist_approach_drop_norm
-        merged.wrist_min_object_gripper_norm = (
-            wrist.wrist_min_object_gripper_norm
-        )
+        merged.wrist_min_object_gripper_norm = wrist.wrist_min_object_gripper_norm
     merged.available = True
     merged.cameras = [
         name
@@ -355,14 +423,21 @@ def _merge_evidence(
     return merged
 
 
-def attach_vision_evidence(data_dir: Path, signals: list[TaskSignals]) -> None:
-    """按真实时间戳为 TaskSignals 附加胸前与腕部视频证据。"""
+def attach_vision_evidence(
+    data_dir: Path,
+    signals: list[TaskEvidence],
+    *,
+    segment_assignments: TaskSegmentAssignments | None = None,
+) -> None:
+    """按真实时间戳为 TaskEvidence 附加胸前与腕部视频证据。"""
     videos = {
         "cam_mid": data_dir / "videos" / "cam_mid_chest.mp4",
         "cam_left": data_dir / "videos" / "cam_left_wrist.mp4",
     }
+    assignments = segment_assignments or resolve_task_segments(data_dir)
     ranges = {
-        key: load_task_video_ranges(data_dir, key) for key in videos
+        key: assignments.video_ranges.get(key, {})
+        for key in videos
     }
     timestamp_maps = load_camera_frame_timestamps(data_dir)
 

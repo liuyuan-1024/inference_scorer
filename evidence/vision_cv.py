@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from config import VISION_BOX_INNER_MARGIN_FRAC, VISION_INSIDE_RATIO
+from domain.rules_v5 import V5_RULES
 
 
 @dataclass
@@ -119,8 +119,8 @@ def box_relation(
     if obj is None or box is None:
         return "unknown", 0.0
     bx1, by1, bx2, by2 = box.bbox
-    margin_x = max(2, round((bx2 - bx1 + 1) * VISION_BOX_INNER_MARGIN_FRAC))
-    margin_y = max(2, round((by2 - by1 + 1) * VISION_BOX_INNER_MARGIN_FRAC))
+    margin_x = max(2, round((bx2 - bx1 + 1) * V5_RULES.vision_box_inner_margin_frac))
+    margin_y = max(2, round((by2 - by1 + 1) * V5_RULES.vision_box_inner_margin_frac))
     inner = np.zeros_like(box.mask)
     cv2.rectangle(
         inner,
@@ -141,7 +141,7 @@ def box_relation(
         bx1 + margin_x <= cx <= bx2 - margin_x
         and by1 + margin_y <= cy <= by2 - margin_y
     )
-    if centroid_in_inner and inside_ratio >= VISION_INSIDE_RATIO:
+    if centroid_in_inner and inside_ratio >= V5_RULES.vision_inside_ratio:
         return "inside", inside_ratio
     if outer_ratio > 0.08 or bx1 <= cx <= bx2 and by1 <= cy <= by2:
         return "edge", inside_ratio

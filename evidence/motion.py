@@ -4,24 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import (
-    APPROACH_ALIGN_MIN,
-    APPROACH_XY_M,
-    APPROACH_Z_DROP_M,
-    FAST_APPROACH_FRAC,
-    MOTION_EE_EXCURSION_M,
-    MOTION_JOINT_EXCURSION_RAD,
-    PATH_EFFICIENCY_MIN,
-    RETRACT_DIST_M,
-    VISION_WRIST_APPROACH_DROP_NORM,
-    VISION_WRIST_NEAR_GRIPPER_NORM,
-)
-from models import TaskSignals
+from domain.models import TaskEvidence
+from domain.rules_v5 import V5_RULES
 
 
-def analyze_motion_phases(
-    task: TaskSignals, *, place_center: np.ndarray
-) -> None:
+def analyze_motion_phases(task: TaskEvidence, *, place_center: np.ndarray) -> None:
     """以抓取帧为界，填充靠近、运输、撤回和归位指标。"""
     ee = task.ee_traj
     n_frames = len(ee)
@@ -38,9 +25,7 @@ def analyze_motion_phases(
     task.approach_z_drop_m = float(start_ee[2] - approach_ee[:, 2].min())
     task.approach_xy_m = float(np.linalg.norm(min_z_ee[:2] - start_ee[:2]))
 
-    path_length = float(
-        np.linalg.norm(np.diff(approach_ee, axis=0), axis=1).sum()
-    )
+    path_length = float(np.linalg.norm(np.diff(approach_ee, axis=0), axis=1).sum())
     straight_distance = float(np.linalg.norm(min_z_ee - start_ee))
     task.path_efficiency = (
         straight_distance / path_length if path_length > 1e-6 else 0.0
@@ -64,18 +49,14 @@ def analyze_motion_phases(
     task.home_xy_error_m = float(np.linalg.norm(home_delta[-1, :2]))
     task.home_z_error_m = float(abs(home_delta[-1, 2]))
     final_home_distance = float(home_distances[-1])
-    task.return_progress_m = max(
-        0.0, task.max_home_excursion_m - final_home_distance
-    )
+    task.return_progress_m = max(0.0, task.max_home_excursion_m - final_home_distance)
     if max_home_index < n_frames - 1:
         if len(task.frame_times) == n_frames:
             task.return_duration_sec = float(
                 task.frame_times[-1] - task.frame_times[max_home_index]
             )
         else:
-            task.return_duration_sec = float(
-                n_frames - 1 - max_home_index
-            ) / 15.0
+            task.return_duration_sec = float(n_frames - 1 - max_home_index) / 15.0
     task.withdraw_home_dist_m = final_home_distance
 
     if grasp_index is None or grasp_index >= n_frames - 1:
@@ -92,28 +73,30 @@ def analyze_motion_phases(
     if len(post_ee) >= 2:
         to_place = place_center[:2] - grasp_ee[:2]
         transported = post_ee[-1][:2] - grasp_ee[:2]
-        if np.linalg.norm(to_place) > 0.03 and np.linalg.norm(transported) > 0.04:
+        if (
+            np.linalg.norm(to_place) > V5_RULES.transport_direction_target_min_m
+            and np.linalg.norm(transported) > V5_RULES.transport_direction_motion_min_m
+        ):
             alignment = float(
                 np.dot(transported, to_place)
                 / (np.linalg.norm(transported) * np.linalg.norm(to_place))
             )
             task.transport_to_place = (
-                alignment > 0.5
-                and task.retract_dist_m >= RETRACT_DIST_M * 0.8
+                alignment > V5_RULES.transport_direction_alignment_min
+                and task.retract_dist_m
+                >= V5_RULES.retract_dist_m * V5_RULES.transport_direction_retract_ratio
             )
 
 
-def detect_motion(task: TaskSignals) -> bool:
+def detect_motion(task: TaskEvidence) -> bool:
     """判断机械臂是否产生了足够的末端或关节位移。"""
     return (
-        task.max_ee_excursion_m >= MOTION_EE_EXCURSION_M
-        or task.max_joint_excursion_rad >= MOTION_JOINT_EXCURSION_RAD
+        task.max_ee_excursion_m >= V5_RULES.motion_ee_excursion_m
+        or task.max_joint_excursion_rad >= V5_RULES.motion_joint_excursion_rad
     )
 
 
-def classify_approach(
-    task: TaskSignals, has_motion: bool
-) -> tuple[bool, str]:
+def classify_approach(task: TaskEvidence, has_motion: bool) -> tuple[bool, str]:
     """返回是否真正靠近目标，以及 fast / slow / wander / none。"""
     if not has_motion:
         return False, "none"
@@ -121,31 +104,31 @@ def classify_approach(
     if task.vision.wrist_available and task.vision.object_present is not False:
         visually_directed = (
             task.vision.wrist_approach_drop_norm
-            >= VISION_WRIST_APPROACH_DROP_NORM
+            >= V5_RULES.vision_wrist_approach_drop_norm
         )
         visually_near = (
             task.vision.wrist_min_object_gripper_norm
-            <= VISION_WRIST_NEAR_GRIPPER_NORM
+            <= V5_RULES.vision_wrist_near_gripper_norm
         )
         has_approach = visually_directed or (
             visually_near and task.grasp_phase_idx is not None
         )
         if has_approach:
             if (
-                task.grasp_time_sec <= 5.0
-                and task.path_efficiency >= PATH_EFFICIENCY_MIN
+                task.grasp_time_sec <= V5_RULES.positioning_fast_sec
+                and task.path_efficiency >= V5_RULES.path_efficiency_min
             ):
                 return True, "fast"
             return True, "slow"
         return False, "wander"
 
-    z_ok = task.approach_z_drop_m >= APPROACH_Z_DROP_M
-    xy_ok = task.approach_xy_m >= APPROACH_XY_M
-    align_ok = task.approach_align >= APPROACH_ALIGN_MIN
-    efficient = task.path_efficiency >= PATH_EFFICIENCY_MIN
+    z_ok = task.approach_z_drop_m >= V5_RULES.approach_z_drop_m
+    xy_ok = task.approach_xy_m >= V5_RULES.approach_xy_m
+    align_ok = task.approach_align >= V5_RULES.approach_align_min
+    efficient = task.path_efficiency >= V5_RULES.path_efficiency_min
     has_approach = z_ok and xy_ok and align_ok and efficient
     if has_approach:
-        if task.approach_frame_frac <= FAST_APPROACH_FRAC:
+        if task.approach_frame_frac <= V5_RULES.fast_approach_frac:
             return True, "fast"
         return True, "slow"
     if not align_ok or not efficient:

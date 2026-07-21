@@ -7,6 +7,9 @@ python3 auto_score.py --data-dir xxx/xxx/action-step_*
 # data_dir 下没有 Excel 时，用 --excel 指定模板复制后再修改
 python3 auto_score.py --data-dir xxx/action-step_* --excel 机械臂抓取模型反馈评分模型.xlsx
 
+# 只运行评分引擎并输出 JSON，不要求 Excel 存在
+python3 auto_score.py --data-dir xxx/action-step_* --no-excel
+
 # 查看评分规则
 python3 auto_score.py --explain
 ```
@@ -16,6 +19,9 @@ python3 auto_score.py --explain
 - 填好 S1~S5 的 Excel；
 - `auto_score_summary.json`（分数、置信度、证据、待复核原因）；
 - 每个评分单元格的 Excel 批注（便于人工追溯）。
+
+JSON 以 task 为中心组织：`tasks[].stages` 包含 S1～S5 的分数、独立置信度、
+评分证据和复核原因，`tasks[].task_evidence` 包含该 task 的多模态综合证据。
 
 视频增强使用 `opencv-python-headless` 直接读取视频。缺少视频或 OpenCV
 无法读取视频时会自动退化为传感器保守评分，并把受影响维度标记为待人工复核。
@@ -57,9 +63,11 @@ S1定位：
 
 S2抓取：
 - 无抓取相位 → 0 (未抓取)
-- 有抓取相位但无接触 → 1 (抓取失败/抓空)
-- 有接触但抓起后掉落(transport < 0.08m) → 2 (抬起掉落)
-- 有接触 + 稳定transport → 3 (稳定抓取)
+- 已闭合但未确认物体进入夹爪，或物体没有随夹爪抬升 → 1 (抓取失败)
+- 确认物体进入夹爪并抬升 ≥2cm，随后在正常释放前持续脱离 → 2 (抬起掉落)
+- 确认获取物体 + 抬升 ≥5cm + 腕部持续保持 + 有效运输 → 3 (稳定抓取)
+
+腕部偶发漏检、夹爪完全闭合、仅 EE 上升均不能单独证明“抬起掉落”。
 
 S3搬运：
 - 无 grasp_transport → 0 (未搬运)
@@ -83,68 +91,112 @@ S5归位：
 
 ```mermaid
 graph LR
-    A[eval_log.jsonl] --> B[loader.py<br>数据加载]
-    C[machine_flow.jsonl] --> B
-    B --> D[TaskSignals<br>原始信号]
-    V[胸前+腕部视频<br>frame_timestamps] --> T[video_io.py<br>时间轴与按需解码]
-    T --> C[vision_cv.py<br>颜色检测与目标跟踪]
-    C --> X[vision.py<br>双视角语义证据]
+    C[machine_flow + task_segments] --> Q[inputs/segments.py<br>TaskSegmentResolver]
+    Y[未来 YOLO 分段器] -. 可替换 .-> Q
+    Q --> B[inputs/eval_log.py<br>按分段加载状态]
+    A[eval_log.jsonl] --> B
+    B --> D[TaskEvidence<br>统一证据对象]
+    V[胸前+腕部视频<br>frame_timestamps] --> T[inputs/video.py<br>时间轴与按需解码]
+    Q --> T
+    T --> CV[evidence/vision_cv.py<br>颜色检测与目标跟踪]
+    CV --> X[evidence/vision.py<br>双视角语义证据]
     X --> E
-    D --> M[grasp_analysis.py<br>抓取与释放信号]
-    D --> K[motion_analysis.py<br>靠近/运输/归位轨迹]
+    D --> M[evidence/grasp.py<br>抓取与释放信号]
+    D --> K[evidence/motion.py<br>靠近/运输/归位轨迹]
     M --> E
-    K --> E[analysis.py<br>task 判定编排]
-    E --> F[TaskJudgment<br>语义判定]
-    F --> G[scoring.py<br>S1~S5 打分]
-    G --> H[excel_io.py<br>写入 Excel]
-    H --> I[机械臂抓取模型反馈评分模型.xlsx]
+    K --> E[evidence/analysis.py<br>证据编排]
+    E --> G[stages/scoring.py<br>阶段评估器编排]
+    G --> S1[stages/positioning.py]
+    G --> S2[stages/grasping.py]
+    G --> S3[stages/transport.py]
+    G --> S4[stages/placing.py]
+    G --> S5[stages/returning.py]
+    S1 --> R[TaskScore / ScoringRun]
+    S2 --> R
+    S3 --> R
+    S4 --> R
+    S5 --> R
+    R --> H[outputs/excel.py<br>Excel 输出]
+    R --> J[outputs/json.py<br>JSON 输出]
 ```
 
-1. `loader.py` — 读取 eval_log.jsonl + machine_flow.jsonl，按 task 分组提取 EE / JC / grip / fz 信号
-2. `video_io.py` + `vision_cv.py` — 对齐真实时间戳、按需解码，再完成颜色检测和连续目标跟踪
-3. `vision.py` — 把胸前与腕部观测转换成夹持保持、掉落、搬运和落点等语义证据
-4. `grasp_analysis.py` + `motion_analysis.py` — 分别提取抓取/释放信号与靠近/运输/归位轨迹指标
-5. `events.py` + `analysis.py` — 生成动作事件链，并编排单个 task 的多模态判定
-6. `scoring.py` — 将事件链映射为 S1~S5 分值，并按视觉/传感器质量计算置信度
-7. `excel_io.py` — 写回 Excel，同时输出 `auto_score_summary.json`
+评分引擎的正式边界为 `pipeline.evaluate_data_dir()`：输入 action_step 目录，
+输出与 Excel 无关的 `ScoringRun`。其中每个 task 使用统一 `TaskEvidence`，
+每个 S1～S5 阶段输出 `StageResult`（分数、置信度、证据、缺失证据、复核原因）。
+Excel 和 JSON 均为下游输出适配器。
+
+1. `inputs/` — 通过可替换的 `TaskSegmentResolver` 识别分段，再读取日志、对齐和解码视频
+2. `evidence/` — 提取运动、抓取、事件链和双视角视觉证据，生成 `TaskEvidence`
+3. `domain/rules_v5.py` — v5 的全部阈值、评分条件、模态权重和置信度策略
+4. `stages/` — 五个阶段直接消费统一证据，分别计算分数与置信度
+5. `pipeline.py` — 编排证据提取与五阶段评分，不依赖具体输出格式
+6. `outputs/` — Excel 与 JSON 输出适配器
 
 # 项目文件结构
 
 ```
-auto_score.py       # 主入口（CLI + 流程编排）
-config.py           # 配置文件（所有阈值、映射、常量）
-models.py           # 数据结构（TaskSignals, TaskJudgment）
-loader.py           # 数据加载（eval_log.jsonl 解析）
-grasp_analysis.py   # 夹爪、关节电流、力信号与抓取/释放事件
-motion_analysis.py  # 靠近、运输、撤回与归位轨迹指标
-analysis.py         # 单个 task 的判定与目录分析编排
-events.py           # 多模态动作事件链与置信度融合
-video_io.py         # 视频边界、真实时间轴与按需解码
-vision_cv.py        # OpenCV 颜色分割、目标跟踪与几何关系
-vision.py           # 双视角夹持保持、掉落、搬运与落点语义
-scoring.py          # 评分映射（S1~S5 打分函数）
-excel_io.py         # Excel 读写
+auto_score.py                       # 命令行入口
+pipeline.py                         # 与输出格式无关的评分引擎入口
+domain/
+│   ├── models.py                   # TaskEvidence、StageResult、TaskScore
+│   └── rules_v5.py                 # 完整、版本化的 v5 规则唯一来源
+inputs/
+│   ├── eval_log.py                 # 状态日志与 task 分段加载
+│   ├── segments.py                 # 可替换的 task segment 识别接口与当前日志实现
+│   └── video.py                    # 视频时间轴与按需解码
+evidence/
+│   ├── analysis.py                 # 多模态证据编排
+│   ├── events.py                   # 动作事件链
+│   ├── grasp.py                    # 抓取与释放信号
+│   ├── motion.py                   # 靠近、运输、撤回和归位轨迹
+│   ├── vision.py                   # 双视角语义证据
+│   └── vision_cv.py                # OpenCV 检测与跟踪
+stages/
+│   ├── common.py                   # 阶段置信度与审计结果
+│   ├── positioning.py              # S1 定位
+│   ├── grasping.py                 # S2 抓取
+│   ├── transport.py                # S3 搬运
+│   ├── placing.py                  # S4 投放
+│   ├── returning.py                # S5 归位
+│   └── scoring.py                  # 五阶段编排
+outputs/
+│   ├── config.py                   # Excel 布局与文件名
+│   ├── console.py                  # 终端摘要与复核信息
+│   ├── excel.py                    # Excel 输出
+│   └── json.py                     # JSON 审计摘要
+tests/
+├── unit/
+│   ├── evidence/                   # 证据提取测试
+│   └── stages/                     # 阶段评分测试
+└── test_pipeline.py                # 端到端边界测试
 ```
 
-# 配置文件（config.py）
+## Task segment 识别器切换
 
-所有可调参数集中在 `config.py`，修改无需动核心逻辑：
+评分流水线不直接依赖 `machine_flow.jsonl` 或 `task_segments.jsonl`。
+默认的 `RecordedTaskSegmentResolver` 会读取这些已记录的边界；未来
+YOLO 分段器只需实现 `TaskSegmentResolver.resolve()`，返回统一的
+`TaskSegmentAssignments`，即可在调用 `evaluate_data_dir()` 时注入，无需修改
+视觉证据、事件链或 S1～S5 评分规则。
+
+# v5规则（domain/rules_v5.py）
+
+所有评分和证据判定参数集中在 `V5RuleSet`：
 
 | 参数 | 默认值 | 作用 |
 |------|--------|------|
-| `MOTION_EE_EXCURSION_M` | 0.01 | EE 相对起点移动多远才算"有运动" |
-| `JC_GRASP_RISE_MIN` | 900 | 无可靠夹爪反馈时 JC 抓取候选阈值 |
-| `APPROACH_Z_DROP_M` | 0.04 | Z 降多少才算"靠近目标" |
-| `WITHDRAW_HOME_M` | 0.12 | 离起点多近才算"归位" |
-| `PLACE_ROI_XY_M` | 0.06 | 放置 ROI 的 XY 容差 |
-| `EXCEL_FILENAME` | 机械臂抓取模型反馈评分模型.xlsx | 评分 Excel 文件名 |
-| `EXCEL_SHEET_NAME` | 推理 (2) | Excel sheet 名 |
+| `motion_ee_excursion_m` | 0.01 | EE 相对起点移动多远才算有运动 |
+| `jc_grasp_rise_min` | 900 | 无可靠夹爪反馈时的抓取候选阈值 |
+| `approach_z_drop_m` | 0.04 | Z 降多少才算靠近目标 |
+| `withdraw_home_xy_m` | 0.10 | 归位水平容差 |
+| `place_roi_xy_m` | 0.06 | 放置 ROI 的 XY 容差 |
+| `V5_STAGE_SPECS[].confidence` | 分阶段 | S1～S5 独立的模态权重、缺失惩罚和复核阈值 |
 
 # 当前局限与复核策略
 
 1. 轻量视觉针对当前“红色玩具 + 黄色盒子”布景；颜色、光照或目标类别变化后需重新标定，或替换为正式分割模型。
 2. S1 的 2cm/3cm 条件仍需要相机内外参和桌面坐标标定；当前仅在稳定抓取能够反证到位时给 3/4 分。
 3. v5 对“有马无盒/有盒无马”没有 N/A 规则。当前 S3/S4 保守记 0，并在摘要中提示应增加独立鲁棒性指标。
-4. v5 的 S5 夹爪状态存在“张开/闭合”文字冲突；当前按评分细则 E23 采用“张开”，可在 `config.py` 中切换。
+4. v5 的 S5 夹爪状态存在“张开/闭合”文字冲突；当前 `V5RuleSet.return_grip_open_required` 按评分细则 E23 采用“张开”。
 5. 设备状态反馈超时、遮挡或视觉/传感器冲突不会静默给高分，而会降低置信度并要求人工复核。
 6. 腕部深度视频当前有效像素较稀疏，尚未作为抓取成功的硬证据。
